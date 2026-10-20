@@ -1277,6 +1277,7 @@ class RecentStore:
             self.data = {}
         self.data.setdefault("hide", False)
         self.data.setdefault("docs", {})
+        self.data.setdefault("modes", {})
 
     def _save(self):
         try:
@@ -1296,6 +1297,18 @@ class RecentStore:
 
     def remove(self, path):
         self.data["docs"].pop(path, None)
+        self._save()
+
+    def get_mode(self, path):
+        m = self.data["modes"].get(os.path.realpath(path), "single")
+        return m if m in ("single", "facing", "book") else "single"
+
+    def set_mode(self, path, mode):
+        key = os.path.realpath(path)
+        if mode == "single":
+            self.data["modes"].pop(key, None)
+        else:
+            self.data["modes"][key] = mode
         self._save()
 
     @property
@@ -1789,7 +1802,10 @@ class MainWindow(QMainWindow):
             self.tabs.widget(i).set_tool(name)
 
     def set_mode(self, mode):
-        self.view().set_view_mode(mode)
+        v = self.view()
+        v.set_view_mode(mode)
+        if v.path:
+            self.recent.set_mode(v.path, mode)
 
     # ---------------------------------------------------------------- tabs
     def new_tab(self):
@@ -1908,6 +1924,7 @@ class MainWindow(QMainWindow):
         fresh = cur is not None and cur.doc is None
         v = cur if fresh else self.new_tab()
         try:
+            v.mode = self.recent.get_mode(path)     # remembered page layout for this file
             v.load(path)
         except Exception as e:
             QMessageBox.warning(self, "Error", "Cannot open file:\n%s" % e)
@@ -1915,6 +1932,8 @@ class MainWindow(QMainWindow):
                 self.close_tab(self.tabs.indexOf(v))
             return
         self.recent.touch(path)
+        if v is self.view():
+            self.mode_actions[v.mode].setChecked(True)
         self._view_changed(v)
 
     def _save_view(self, v):
