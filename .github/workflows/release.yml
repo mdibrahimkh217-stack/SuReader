@@ -1,0 +1,51 @@
+name: Build packages
+
+# Builds the AppImage, .deb and .rpm from source on GitHub's servers.
+#  - Push a tag like v1.1 (or publish a Release with that tag) -> packages are attached to the Release.
+#  - "Run workflow" button (Actions tab) -> builds only, packages appear as a downloadable artifact.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y rpm python3-pip curl
+
+      - name: Work out the version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "ver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=0.0.0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .deb
+        run: bash packaging/build_deb.sh "${{ steps.v.outputs.ver }}"
+
+      - name: Build .rpm
+        run: bash packaging/build_rpm.sh "${{ steps.v.outputs.ver }}"
+
+      - name: Build AppImage
+        run: bash packaging/build_appimage.sh
+
+      - name: Keep the packages as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/*
+
+      - name: Attach packages to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
