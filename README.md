@@ -1,3 +1,5 @@
+<img width="1366" height="736" alt="Screenshot from 2026-11-03 17-25-09" src="https://github.com/user-attachments/assets/3c55bf4e-35f5-4f02-a7cd-29901fadea32" />
+<img width="1365" height="713" alt="Screenshot from 2026-11-03 17-26-22" src="https://github.com/user-attachments/assets/7f5d9e13-8d63-4e20-9d7c-dcc7f63ebaea" />
 # SuReader
 
 A lightweight, fast PDF reader for Linux in the spirit of SumatraPDF — **native, no Wine**.
