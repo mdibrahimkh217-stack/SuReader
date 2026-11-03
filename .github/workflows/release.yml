@@ -1,0 +1,53 @@
+name: Build packages
+
+# Builds the AppImage, .deb and .rpm from source on GitHub's servers.
+# Run it with the "Run workflow" button (Actions tab). The packages are attached to ONE release
+# called "SuReader" (tag "latest") - no version in the release name or in the file names.
+# The packages are also kept as a downloadable artifact of the run.
+# (Pushing a tag like v1.1 still works: it publishes a release with that tag, titled "SuReader".)
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y rpm python3-pip curl
+
+      # The version is only written inside the packages (read from APP_VERSION in sureader.py)
+      - name: Build .deb
+        run: bash packaging/build_deb.sh
+
+      - name: Build .rpm
+        run: bash packaging/build_rpm.sh
+
+      - name: Build AppImage
+        run: bash packaging/build_appimage.sh
+
+      - name: Keep the packages as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/*
+
+      - name: Move the "latest" tag to this commit
+        if: github.ref_type != 'tag'
+        run: |
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Publish the release "SuReader"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          name: SuReader
+          make_latest: true
+          files: dist/*
