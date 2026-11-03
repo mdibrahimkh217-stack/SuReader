@@ -6,12 +6,29 @@ Python + Qt (PyQt5/PyQt6) + PyMuPDF.
 ## Features
 - **Right mouse button held + wheel → zoom at the pointer** (stays exactly under the cursor)
 - **Start page** like SumatraPDF's "Frequently Read": an empty tab shows thumbnails of your most-opened documents (click to open, right-click to remove, "Hide frequently read" to turn it off)
-- Tabs (Ctrl+O / Ctrl+W / Ctrl+Tab)
+- Tabs (Ctrl+O / Ctrl+W / Ctrl+Tab) plus a **Tabs ▾** drop-down listing every open tab, **File → Open Recent** (last 10 documents)
 - Single page, **facing (two pages)** and **book** views (Ctrl+6 / 7 / 8)
-- **Annotations:** highlight, underline, strikeout, pen, notes; delete; save in place or save as
+- **Annotations:** highlight, underline, strikeout, pen, notes; delete. Save asks "save to this same file?" (Yes = replace, No = choose another file); saves are written to a temporary file and verified before the original is replaced; closing with unsaved annotations asks again
 - Text selection / copy, **search** (Ctrl+F, F3 / Shift+F3), **links** (internal, named destinations, http/mailto), Alt+Left to go back
 - Separate closable panels: **Outline**, **Thumbnails**, **Bookmarks** (F6 / F7 / F8; per-file bookmarks kept in `~/.config/sumatra-linux/bookmarks.json`)
 - Fit width / fit page / actual size, go to page, fullscreen, drag & drop, password-protected PDFs, ePub/XPS/CBZ viewing
+
+
+## What's new in 2.0
+- **Undo / Redo** (Edit menu, Ctrl+Z / Ctrl+Y) for every change: highlights, underlines, pen strokes, notes, text boxes, deletions, edits.
+- **Settings menu:** zoom speed, mouse-wheel zoom direction (normal / inverted), dark mode (+ optional page inversion),
+  bookmarks with thumbnails on/off, highlight mode.
+- **Highlight modes:** *with selection* (draw a rectangle, resize / move it, ✔ or Enter to apply, ✕ or Esc to cancel),
+  *with select text*, or **Automatic** (text selection over text, rectangle over images / figures; Alt forces the rectangle).
+- **Remove part of a highlight / underline / strikeout:** select the text with the Select-text tool, right-click, "Remove ... from selection".
+- **Text box tool** (X) - English and Bengali (any script) text; click a box to edit it.
+- **Second ribbon:** Refresh, page box "22 / 100" with arrows, zoom box (presets, Fit width / Fit page, typed %), + / -.
+- **Print** (Ctrl+P) with page ranges.
+- **Big scanned books:** pages are rendered in the background (never freezes while scrolling), thumbnails are virtualised;
+  bookmarks can show page thumbnails.
+
+- **Settings > Opening PDFs:** tab mode (default) or window mode (each PDF in its own window, no tab bar).
+- One compact ribbon: Refresh, Save, Home, tools, page box, zoom box. Highlight / underline / strikeout / pen colours are set in Edit (or from the right-click menu).
 
 ## Run from source
 ```bash
@@ -39,14 +56,21 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Build locally with `packaging/build_deb.
 ## Keys
 | | |
 |---|---|
-| Tools | H hand · T select text · L highlight · U underline · K strikeout · P pen · N note · E delete annotation |
+| Tools | H hand · T select text · L highlight · U underline · K strikeout · P pen · N note · X text box |
 | View | Ctrl+1 actual size · Ctrl+2 fit page · Ctrl+3 fit width · Ctrl+= / Ctrl+- zoom · F11 fullscreen |
 | File | Ctrl+O open · Ctrl+S save · Ctrl+Shift+S save as · Ctrl+R reload · Ctrl+G go to page |
 | Other | Ctrl+D add bookmark · Ctrl+F find · Ctrl+C copy · Esc clear selection |
 
+## Robustness
+- Saves go to a temporary file, are verified (page count, password protection) and only then replace the original.
+- PDFs whose cross-reference chain is damaged (opens with 0 pages in some readers, e.g. an incremental update whose `/Prev` points at itself) are repaired in memory when opened; Save writes a clean file.
+
 ## Not implemented yet
-Match-case search, clickable plain-text URLs, continuous/non-continuous toggle.
+Match-case search, clickable plain-text URLs, continuous/non-continuous toggle, Bengali (complex-script) text in FreeText annotations of other PDF editors.
 
 ## License
 SuReader depends on PyMuPDF (AGPL-3.0) and PyQt (GPL-3.0). Distributing it (including the AppImage) means
 the project should be released under a compatible license such as **AGPL-3.0**. Pick one and add a `LICENSE` file.
+
+- Start page: pin a book (pin icon on its thumbnail, or right-click > Pin book) to keep it there; the start page lists the 10 most recently opened books, and pinned books are not counted in those 10.
+- Settings > Home overview: choose "Recent read" (last opened first, default) or "Frequently read" (most opened first) for the start page.
