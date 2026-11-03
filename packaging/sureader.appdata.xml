@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mdibrahimkh217_stack.SuReader</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>SuReader</name>
+  <developer id="io.github.mdibrahimkh217-stack"><name>SuReader contributors</name></developer>
+  <summary>Lightweight SumatraPDF-style PDF reader</summary>
+  <description>
+    <p>SuReader is a fast, simple PDF reader for Linux in the spirit of SumatraPDF. It is native and needs no Wine.</p>
+    <p>Tabs, single, facing and book views, highlight / underline / strikeout / pen / note / text box annotations, search, links, outline, thumbnails, bookmarks and a Home page of recent books. Hold the right mouse button and scroll the wheel to zoom at the pointer.</p>
+  </description>
+  <launchable type="desktop-id">sureader.desktop</launchable>
+  <url type="homepage">https://github.com/mdibrahimkh217-stack/SuReader</url>
+  <url type="bugtracker">https://github.com/mdibrahimkh217-stack/SuReader/issues</url>
+  <provides>
+    <binary>sureader</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>
