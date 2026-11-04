@@ -70,5 +70,9 @@ Match-case search, clickable plain-text URLs, continuous/non-continuous toggle, 
 
 ## License
 SuReader is released under the **AGPL-3.0** (see `LICENSE`), as required by its dependencies PyMuPDF (AGPL-3.0) and PyQt (GPL-3.0).
-<img width="1365" height="733" alt="image" src="https://github.com/user-attachments/assets/e59d5324-9e49-4eae-a087-35fe304fdfad" />
+<p align="center">
+  <img width="49%" alt="SuReader home" src="https://github.com/user-attachments/assets/e59d5324-9e49-4eae-a087-35fe304fdfad" />
+  <img width="49%" alt="SuReader reading" src="https://github.com/user-attachments/assets/7b49a74d-2aee-4d48-8b71-19dde3c047f1" />
+</p>
+
 
