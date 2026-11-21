@@ -68,11 +68,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Build locally with `packaging/build_deb.
 ## Not implemented yet
 Match-case search, clickable plain-text URLs, continuous/non-continuous toggle, Bengali (complex-script) text in FreeText annotations of other PDF editors.
 
+- **Text box editor:** a dialog with Bold, Italic, Underline, Strikethrough, Superscript and Subscript for the selected text (Ctrl+B / Ctrl+I / Ctrl+U), text size in % (100 % = 12 pt), text colour and background colour. One plain format = real PDF text; mixed formats or Bengali = saved as an image (the editor shows a warning). The description is kept inside the PDF, so the box can be edited again.
+- **CMYK colours:** Settings > Colors holds 7 colours for each of highlight, underline, strikeout and pen. Everything is CMYK, so annotations print with exactly the chosen inks.
+- **Session:** Settings > Session: start new, restore the previous session, or ask every time. Middle click closes a tab. Thumbnails grow and shrink with their panel.
+
 ## License
 SuReader is released under the **AGPL-3.0** (see `LICENSE`), as required by its dependencies PyMuPDF (AGPL-3.0) and PyQt (GPL-3.0).
-<p align="center">
-  <img width="49%" alt="SuReader home" src="https://github.com/user-attachments/assets/e59d5324-9e49-4eae-a087-35fe304fdfad" />
-  <img width="49%" alt="SuReader reading" src="https://github.com/user-attachments/assets/7b49a74d-2aee-4d48-8b71-19dde3c047f1" />
-</p>
-
-

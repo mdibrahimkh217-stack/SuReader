@@ -26,6 +26,8 @@ Run:           python3 sureader.py [a.pdf b.pdf ...]
 * Tabs button     right end of the ribbon: drop-down list of all open tabs
 * Settings > Opening PDFs: tab mode (default) or window mode (each PDF in its own window, no tab bar)
 * Settings > Page render: 1-100 % of the book kept rendered around the page you read (half behind, half ahead)
+* Settings > Colors: 7 CMYK colours for each of highlight / underline / strikeout / pen
+* Settings > Session: start new / restore the previous session / ask every time
 * View            Ctrl+1 actual size  Ctrl+2 fit page  Ctrl+3 fit width  Ctrl+= / Ctrl+-
                   Ctrl+G go to page   Ctrl+R reload    F11 fullscreen
 """
@@ -35,6 +37,7 @@ import platform
 import re
 import gc
 import json
+import math
 import contextlib
 import time
 import hashlib
@@ -49,30 +52,32 @@ except ImportError:                      # older PyMuPDF
 
 try:
     from PyQt6.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, QPoint, QRect, QObject, QUrl,
-                              pyqtSignal)
+                              pyqtSignal, QEvent)
     from PyQt6.QtGui import (QImage, QPainter, QColor, QAction, QActionGroup,
                              QKeySequence, QPen, QPixmap, QIcon, QDesktopServices, QPalette, QFont,
-                             QFontMetrics, QIntValidator)
+                             QFontMetrics, QIntValidator, QTextDocument, QTextCursor, QTextCharFormat,
+                             QTextFormat)
     from PyQt6.QtWidgets import (
         QAbstractScrollArea, QApplication, QComboBox, QFileDialog, QInputDialog,
         QLineEdit, QMainWindow, QMenu, QMessageBox, QTabWidget, QToolBar,
         QDockWidget, QListView, QListWidget, QListWidgetItem, QTreeWidget,
         QTreeWidgetItem, QLabel, QFrame, QGridLayout, QVBoxLayout, QScrollArea, QWidget,
         QToolButton, QSizePolicy, QDialog, QTextBrowser, QDialogButtonBox, QSlider, QHBoxLayout,
-        QAbstractItemView)
+        QAbstractItemView, QTextEdit, QSpinBox, QPushButton, QWidgetAction)
 except ImportError:                      # Qt5 (older distros, e.g. glibc < 2.33)
     from PyQt5.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, QPoint, QRect, QObject, QUrl,
-                              pyqtSignal)
+                              pyqtSignal, QEvent)
     from PyQt5.QtGui import (QImage, QPainter, QColor, QKeySequence, QPen,
                              QPixmap, QIcon, QDesktopServices, QPalette, QFont,
-                             QFontMetrics, QIntValidator)
+                             QFontMetrics, QIntValidator, QTextDocument, QTextCursor, QTextCharFormat,
+                             QTextFormat)
     from PyQt5.QtWidgets import (
         QAbstractScrollArea, QApplication, QComboBox, QFileDialog, QInputDialog,
         QLineEdit, QMainWindow, QMenu, QMessageBox, QTabWidget, QToolBar,
         QAction, QActionGroup, QDockWidget, QListView, QListWidget,
         QListWidgetItem, QTreeWidget, QTreeWidgetItem, QLabel, QFrame, QGridLayout,
         QVBoxLayout, QScrollArea, QWidget, QToolButton, QSizePolicy, QDialog, QTextBrowser,
-        QDialogButtonBox, QSlider, QHBoxLayout, QAbstractItemView)
+        QDialogButtonBox, QSlider, QHBoxLayout, QAbstractItemView, QTextEdit, QSpinBox, QPushButton, QWidgetAction)
 
 
 try:                                      # printing is optional
@@ -105,10 +110,6 @@ MIN_Z, MAX_Z = 0.05 * BASE, 64 * BASE
 MARGIN, GAP = 10, 10
 FULL_RENDER_LIMIT = 16_000_000   # pixels; bigger pages are rendered clipped
 
-COLORS = [("Yellow", (1.0, 0.92, 0.2)), ("Red", (0.9, 0.15, 0.15)),
-          ("Green", (0.35, 0.85, 0.35)), ("Pink", (1.0, 0.5, 0.75)),
-          ("Blue", (0.3, 0.55, 1.0)), ("Orange", (1.0, 0.6, 0.15)),
-          ("Black", (0.0, 0.0, 0.0))]
 TOOLS = [("hand", "Hand", "H"), ("select", "Select", "T"),
          ("highlight", "Highlight", "L"), ("underline", "Underline", "U"),
          ("strike", "Strikeout", "K"), ("pen", "Pen", "P"),
@@ -116,8 +117,14 @@ TOOLS = [("hand", "Hand", "H"), ("select", "Select", "T"),
 MARKUP = ("highlight", "underline", "strike")
 COLOR_KINDS = ("highlight", "underline", "strike", "pen")      # tools that have their own colour
 KIND_LABELS = {"highlight": "Highlight", "underline": "Underline", "strike": "Strikeout", "pen": "Pen"}
-COLOR_BY_NAME = dict(COLORS)
-NOTE_COLOR = COLORS[0][1]
+SLOTS = 7                                  # colours per tool
+OLD_COLOR_NAMES = ["Yellow", "Red", "Green", "Pink", "Blue", "Orange", "Black"]    # older settings used names
+# every colour is CMYK, in percent (c, m, y, k): the PDF gets exactly these inks
+DEFAULT_PALETTE = {k: [(0, 0, 100, 0), (0, 100, 100, 0), (100, 0, 100, 0), (0, 50, 0, 0),
+                       (100, 100, 0, 0), (0, 50, 100, 0), (0, 0, 0, 100)] for k in COLOR_KINDS}
+NOTE_COLOR = (0.0, 0.0, 1.0, 0.0)          # notes are yellow
+TB_BASE_PT = 12.0                          # text box text size at 100 %
+TB_BLACK, TB_WHITE = (0, 0, 0, 100), (0, 0, 0, 0)
 MARKUP_TYPES = {"highlight": "Highlight", "underline": "Underline", "strike": "StrikeOut"}
 MARKUP_LABELS = {"highlight": "highlight", "underline": "underline", "strike": "strikeout"}
 HANDLE_CURSORS = {"n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
@@ -145,6 +152,114 @@ def make_dark_palette():
     for role in (R.Text, R.ButtonText, R.WindowText):
         p.setColor(G.Disabled, role, QColor(125, 125, 125))
     return p
+
+
+_cmyk_cache = {}
+
+
+def cmyk_rgb(c):
+    """Screen colour (r, g, b in 0-1) of a CMYK colour given in percent. It is MuPDF's own conversion,
+    so a swatch looks exactly like the annotation on the page."""
+    c = tuple(int(v) for v in c)
+    r = _cmyk_cache.get(c)
+    if r is None:
+        try:
+            px = pymupdf.Pixmap(pymupdf.csCMYK, pymupdf.IRect(0, 0, 1, 1), False)
+            px.set_pixel(0, 0, tuple(int(round(v * 255 / 100.0)) for v in c))
+            r = tuple(v / 255.0 for v in pymupdf.Pixmap(pymupdf.csRGB, px).pixel(0, 0)[:3])
+        except Exception:
+            k = 1 - c[3] / 100.0
+            r = tuple((1 - c[i] / 100.0) * k for i in range(3))
+        _cmyk_cache[c] = r
+    return r
+
+
+def pdf_cmyk(c):
+    """CMYK in percent -> the 0-1 tuple PyMuPDF wants."""
+    return tuple(v / 100.0 for v in c)
+
+
+def swatch_pixmap(cmyk, w, h, tick=False, round_=False):
+    """A colour swatch. cmyk None = no colour (white with a red slash). `tick` draws a check mark."""
+    pm = QPixmap(w, h)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    r = QRectF(0.5, 0.5, w - 1, h - 1)
+    rgb = None
+    if cmyk is None:
+        fill = QColor(255, 255, 255)
+    else:
+        rgb = cmyk_rgb(cmyk)
+        fill = qcolor(rgb)
+    p.setPen(QPen(QColor(110, 110, 110), 1))
+    p.setBrush(fill)
+    if round_:
+        p.drawEllipse(r)
+    else:
+        p.drawRect(r)
+    if cmyk is None:
+        p.setPen(QPen(QColor(210, 40, 40), 1.5))
+        p.drawLine(QPointF(3, h - 3), QPointF(w - 3, 3))
+    if tick:
+        lum = 1.0 if rgb is None else 0.3 * rgb[0] + 0.59 * rgb[1] + 0.11 * rgb[2]
+        p.setPen(QPen(QColor(255, 255, 255) if lum < 0.5 else QColor(0, 0, 0), 2.2))
+        cx, cy = w / 2.0, h / 2.0
+        p.drawLine(QPointF(cx - 7, cy), QPointF(cx - 2.5, cy + 4))
+        p.drawLine(QPointF(cx - 2.5, cy + 4), QPointF(cx + 6, cy - 4.5))
+    p.end()
+    return pm
+
+
+def close_popups():
+    w = QApplication.activePopupWidget()
+    while w is not None:
+        w.close()
+        w = QApplication.activePopupWidget()
+
+
+class SwatchItem(QWidget):
+    """A menu row that shows only a colour (no name); the selected one carries a check mark."""
+
+    def __init__(self, cmyk, callback, tick=False):
+        super().__init__()
+        self.cmyk, self.cb, self.tick, self._hover = cmyk, callback, tick, False
+        self.setFixedSize(124, 24)
+        self.setMouseTracking(True)
+
+    def set_state(self, cmyk, tick):
+        self.cmyk, self.tick = cmyk, tick
+        self.update()
+
+    def enterEvent(self, ev):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, ev):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        if self._hover:
+            c = self.palette().color(QPalette.ColorRole.Highlight)
+            c.setAlpha(110)
+            p.fillRect(self.rect(), c)
+        p.drawPixmap(6, 4, swatch_pixmap(self.cmyk, self.width() - 12, self.height() - 8, self.tick))
+        p.end()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            close_popups()
+            self.cb()
+
+
+def swatch_action(menu, cmyk, callback, tick=False):
+    act = QWidgetAction(menu)
+    item = SwatchItem(cmyk, callback, tick)
+    act.setDefaultWidget(item)
+    menu.addAction(act)
+    return item
 
 
 def qcolor(rgb, alpha=255):
@@ -188,7 +303,9 @@ class PdfView(QAbstractScrollArea):
         self.rect_sel = None        # adjustable rectangle: {"page": i, "rect": Rect}
         self._rect_drag = None
         self.tool = "hand"
-        self.colors = {k: COLORS[0][1] for k in COLOR_KINDS}     # colour of each tool
+        self.colors = {k: DEFAULT_PALETTE[k][0] for k in COLOR_KINDS}     # CMYK % of each tool
+        self.tb_defaults = {"text": TB_BLACK, "bg": TB_WHITE, "size": 100}     # for new text boxes
+        self.on_tb_defaults = None
         self.render_pct = 20               # Settings > Page render: % of the book kept rendered around the view
         self.menu_factory = None
         self.zoom_pct = 10        # % zoom change per wheel notch
@@ -917,7 +1034,7 @@ class PdfView(QAbstractScrollArea):
                 a = fn(quads=self.sel_rects(i))
                 if a is None:
                     continue
-                a.set_colors(stroke=self.colors[kind])
+                a.set_colors(stroke=self.pdf_color(kind))
                 a.update()
                 done.append(i)
         self._touch(done)
@@ -933,10 +1050,13 @@ class PdfView(QAbstractScrollArea):
                 page = self.doc[i]
                 a = page.add_ink_annot([[(float(x), float(y)) for x, y in pts]])
                 a.set_border(width=1.8)
-                a.set_colors(stroke=self.colors["pen"])
+                a.set_colors(stroke=self.pdf_color("pen"))
                 a.update()
             self._touch([i])
         self.viewport().update()
+
+    def pdf_color(self, kind):
+        return pdf_cmyk(self.colors[kind])
 
     def add_note(self, i, x, y, text):
         with self.op("Note"):
@@ -1127,7 +1247,7 @@ class PdfView(QAbstractScrollArea):
             page = self.doc[i]                  # keep the page alive while the annotation is edited
             # a translucent rectangle (a real Highlight annotation would bulge past the chosen area)
             a = page.add_rect_annot(r)
-            a.set_colors(stroke=self.colors["highlight"], fill=self.colors["highlight"])
+            a.set_colors(stroke=self.pdf_color("highlight"), fill=self.pdf_color("highlight"))
             a.set_border(width=0)
             a.set_opacity(0.4)
             a.update()
@@ -1142,46 +1262,131 @@ class PdfView(QAbstractScrollArea):
         self.viewport().update()
 
     # ------------------------------------------------------------- text boxes
-    def _textbox_color(self):
-        return (0.0, 0.0, 0.0)
+    @staticmethod
+    def _tb_default_model(defaults):
+        c = tuple(defaults.get("text", TB_BLACK))
+        return {"size": int(defaults.get("size", 100)), "bg": defaults.get("bg", TB_WHITE),
+                "runs": [{"t": "", "b": 0, "i": 0, "u": 0, "s": 0, "v": 0, "c": c}]}
+
+    def _tb_model_of(self, annot):
+        """The editable description of an existing text box (formatting is kept in the annotation)."""
+        info = annot.info
+        subj = info.get("subject", "") or ""
+        if subj.startswith("SuReader-tb:"):
+            try:
+                m = json.loads(subj[len("SuReader-tb:"):])
+                if isinstance(m, dict) and m.get("runs"):
+                    m["bg"] = tuple(m["bg"]) if m.get("bg") else None
+                    for r in m["runs"]:
+                        r["c"] = tuple(r["c"])
+                    m["size"] = int(m.get("size", 100))
+                    return m
+            except Exception:
+                pass
+        m = self._tb_default_model({"size": 100, "bg": None})        # boxes made by older versions
+        m["runs"][0]["t"] = info.get("content", "") or ""
+        return m
+
+    def _create_textbox(self, page, rect, model):
+        """Create the annotation (call inside an op). One plain format + Latin text -> a standard
+        FreeText annotation (real, selectable PDF text). Anything else (mixed formats, underline,
+        super/subscript, Bengali ...) -> drawn by Qt as CMYK layers, with the description kept inside."""
+        text = "".join(r["t"] for r in model["runs"])
+        rect = pymupdf.Rect(rect)
+        bg = model.get("bg")
+        bg_f = pdf_cmyk(bg) if bg else None
+        fs = TB_BASE_PT * model["size"] / 100.0
+        plain = model_plain_format(model)
+        meta = "SuReader-tb:" + json.dumps({"size": model["size"], "bg": list(bg) if bg else None,
+                                            "runs": [dict(r, c=list(r["c"])) for r in model["runs"]]},
+                                           separators=(",", ":"))
+        if plain is not None:
+            bold, italic, col = plain
+            base = {(0, 0): "Helvetica", (1, 0): "Helvetica-Bold", (0, 1): "Helvetica-Oblique",
+                    (1, 1): "Helvetica-BoldOblique"}[(bold, italic)]
+            short = {(0, 0): "helv", (1, 0): "hebo", (0, 1): "heit", (1, 1): "hebi"}[(bold, italic)]
+            width = max(rect.width, 40)
+            lines = self._wrap_latin(text, short, fs, width - 6)
+            leading = fs * 1.2
+            rect.y1 = max(rect.y1, rect.y0 + len(lines) * leading + 6)
+            rect.x1 = max(rect.x1, rect.x0 + 40)
+            a = page.add_freetext_annot(rect, text, fontsize=fs, fontname="helv",
+                                        text_color=pdf_cmyk(col), fill_color=bg_f, align=0)
+            self._set_text_appearance(a, lines, base, fs, leading, col, bg, rect.width, rect.height)
+        else:
+            S = 4                                              # 4x supersampling (288 dpi)
+            wpt = max(rect.width, 40)
+            wpx = int(wpt * S)
+            hpt = max(rect.height, math.ceil(doc_from_model(model, S, wpx).size().height()) / S + 2)
+            hpx = int(hpt * S)
+            layers = []
+            for c in sorted({tuple(r["c"]) for r in model["runs"] if r["t"].strip()}):
+                img = QImage(wpx, hpx, QImage.Format.Format_ARGB32)
+                img.fill(0)
+                pnt = QPainter(img)
+                pnt.setRenderHint(QPainter.RenderHint.Antialiasing)
+                pnt.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+                doc_from_model(model, S, wpx, only=c).drawContents(pnt, QRectF(0, 0, wpx, hpx))
+                pnt.end()
+                ptr = img.constBits()
+                ptr.setsize(img.sizeInBytes() if hasattr(img, "sizeInBytes") else img.byteCount())
+                layers.append((c, bytes(ptr)[3::4]))
+            rect = pymupdf.Rect(rect.x0, rect.y0, rect.x0 + wpt, rect.y0 + hpt)
+            a = page.add_freetext_annot(rect, " ", fontsize=12, fontname="helv", text_color=(0, 0, 0, 1),
+                                        fill_color=bg_f, align=0)
+            self._set_layered_appearance(a, layers, bg, wpx, hpx, rect.width, rect.height)
+        a.set_info(content=text, subject=meta)
+        return a
 
     @staticmethod
-    def _is_latin1(text):
+    def _wrap_latin(text, short, fs, width):
+        lines = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split(" "):
+                cand = word if not cur else cur + " " + word
+                if pymupdf.get_text_length(cand, fontname=short, fontsize=fs) <= width or not cur:
+                    cur = cand
+                else:
+                    lines.append(cur)
+                    cur = word
+                while pymupdf.get_text_length(cur, fontname=short, fontsize=fs) > width and len(cur) > 1:
+                    k = len(cur) - 1                    # one very long word: break it
+                    while k > 1 and pymupdf.get_text_length(cur[:k], fontname=short, fontsize=fs) > width:
+                        k -= 1
+                    lines.append(cur[:k])
+                    cur = cur[k:]
+            lines.append(cur)
+        return lines
+
+    def _set_text_appearance(self, annot, lines, basefont, fs, leading, col, bg, w_pt, h_pt):
+        """Appearance stream with REAL text in the chosen Helvetica variant and exact CMYK inks."""
+        doc = self.doc
+        orig = getattr(pymupdf, "JM_have_operation", None)
+        if orig is not None:
+            pymupdf.JM_have_operation = lambda pdf: 1
         try:
-            text.encode("latin-1")
-            return True
-        except UnicodeEncodeError:
-            return False
+            xfont = doc.get_new_xref()
+            doc.update_object(xfont, "<</Type/Font/Subtype/Type1/BaseFont/%s/Encoding/WinAnsiEncoding>>" % basefont)
+            ops = []
+            if bg:
+                ops.append("%g %g %g %g k\n0 0 %g %g re f\n" % (tuple(v / 100.0 for v in bg) + (w_pt, h_pt)))
+            ops.append("BT\n%g %g %g %g k\n/F1 %g Tf\n%g TL\n3 %g Td\n"
+                       % (tuple(v / 100.0 for v in col) + (fs, leading, h_pt - 3 - fs * 0.8)))
+            body = b"".join(b"(" + ln.encode("latin-1", "replace").replace(b"\\", b"\\\\").replace(b"(", b"\\(")
+                            .replace(b")", b"\\)") + b") Tj T*\n" for ln in lines)
+            xf = doc.get_new_xref()
+            doc.update_object(xf, "<</Type/XObject/Subtype/Form/BBox[0 0 %g %g]/Resources<</Font<</F1 %d 0 R>>>>>>"
+                                  % (w_pt, h_pt, xfont))
+            doc.update_stream(xf, "".join(ops).encode() + body + b"ET\n")
+            doc.xref_set_key(annot.xref, "AP", "<</N %d 0 R>>" % xf)
+        finally:
+            if orig is not None:
+                pymupdf.JM_have_operation = orig
 
-    def _render_text_image(self, text, width_pt, rgb):
-        """Draw `text` with Qt (full Unicode / Bengali shaping) -> (QImage, width_pt, height_pt)."""
-        S = 4                                           # 4x supersampling (288 dpi)
-        font = QFont(QApplication.font())
-        font.setPixelSize(12 * S)
-        flags = int(Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        wpx = max(40 * S, int(width_pt * S))
-        br = QFontMetrics(font).boundingRect(QRect(0, 0, wpx - 2 * S, 100000), flags, text)
-        hpx = max(br.height() + 2 * S, 18 * S)
-        img = QImage(wpx, hpx, QImage.Format.Format_ARGB32)
-        img.fill(0)
-        pnt = QPainter(img)
-        pnt.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pnt.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        pnt.setFont(font)
-        pnt.setPen(qcolor(rgb))
-        pnt.drawText(QRectF(S, S, wpx - 2 * S, hpx - S), flags, text)
-        pnt.end()
-        return img, wpx / S, hpx / S
-
-    def _set_image_appearance(self, annot, img, w_pt, h_pt):
-        """Give `annot` an appearance stream that shows the QImage `img` (with transparency)."""
-        img = img.convertToFormat(QImage.Format.Format_ARGB32)
-        ptr = img.constBits()
-        ptr.setsize(img.sizeInBytes() if hasattr(img, "sizeInBytes") else img.byteCount())
-        bgra = bytes(ptr)
-        w, h = img.width(), img.height()
-        rgb = bytearray(w * h * 3)
-        rgb[0::3], rgb[1::3], rgb[2::3] = bgra[2::4], bgra[1::4], bgra[0::4]
+    def _set_layered_appearance(self, annot, layers, bg, wpx, hpx, w_pt, h_pt):
+        """Appearance stream: the background as a CMYK rectangle, then every text colour as a solid
+        CMYK image shown through its own soft mask - exact inks, smooth edges, transparent between."""
         doc = self.doc
         # PyMuPDF 1.24's journalling check raises while an operation is open, although creating
         # objects inside the operation is exactly what we want (one undo step) -> skip that check
@@ -1189,49 +1394,30 @@ class PdfView(QAbstractScrollArea):
         if orig is not None:
             pymupdf.JM_have_operation = lambda pdf: 1
         try:
-            xs = doc.get_new_xref()
-            doc.update_object(xs, "<</Type/XObject/Subtype/Image/Width %d/Height %d/ColorSpace/DeviceGray"
-                                   "/BitsPerComponent 8>>" % (w, h))
-            doc.update_stream(xs, bytes(bgra[3::4]), compress=True)
-            xi = doc.get_new_xref()
-            doc.update_object(xi, "<</Type/XObject/Subtype/Image/Width %d/Height %d/ColorSpace/DeviceRGB"
-                                   "/BitsPerComponent 8/SMask %d 0 R>>" % (w, h, xs))
-            doc.update_stream(xi, bytes(rgb), compress=True)
+            ops, xobj = [], []
+            if bg:
+                ops.append("%g %g %g %g k\n0 0 %g %g re f\n" % (tuple(v / 100.0 for v in bg) + (w_pt, h_pt)))
+            for n, (c, alpha) in enumerate(layers):
+                xs = doc.get_new_xref()
+                doc.update_object(xs, "<</Type/XObject/Subtype/Image/Width %d/Height %d/ColorSpace/DeviceGray"
+                                      "/BitsPerComponent 8>>" % (wpx, hpx))
+                doc.update_stream(xs, alpha, compress=True)
+                xi = doc.get_new_xref()
+                doc.update_object(xi, "<</Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceCMYK"
+                                      "/BitsPerComponent 8/SMask %d 0 R>>" % xs)
+                doc.update_stream(xi, bytes(int(round(v * 255 / 100.0)) for v in c))
+                ops.append("q %g 0 0 %g 0 0 cm /Im%d Do Q\n" % (w_pt, h_pt, n))
+                xobj.append("/Im%d %d 0 R" % (n, xi))
             xf = doc.get_new_xref()
-            doc.update_object(xf, "<</Type/XObject/Subtype/Form/BBox[0 0 %g %g]"
-                                  "/Resources<</XObject<</Im0 %d 0 R>>>>>>" % (w_pt, h_pt, xi))
-            doc.update_stream(xf, ("q %g 0 0 %g 0 0 cm /Im0 Do Q" % (w_pt, h_pt)).encode())
+            doc.update_object(xf, "<</Type/XObject/Subtype/Form/BBox[0 0 %g %g]/Resources<</XObject<<%s>>>>>>"
+                                  % (w_pt, h_pt, " ".join(xobj)))
+            doc.update_stream(xf, "".join(ops).encode())
             doc.xref_set_key(annot.xref, "AP", "<</N %d 0 R>>" % xf)
         finally:
             if orig is not None:
                 pymupdf.JM_have_operation = orig
 
-    def _create_textbox(self, page, rect, text):
-        """Create the annotation (call inside an op). Latin text -> a standard FreeText annotation;
-        other scripts -> a FreeText whose appearance is drawn by Qt, so Bengali etc. render correctly."""
-        col = self._textbox_color()
-        rect = pymupdf.Rect(rect)
-        if self._is_latin1(text):
-            width = max(rect.width, 40)
-            lines = 0
-            for para in text.split("\n"):
-                tl = pymupdf.get_text_length(para or " ", fontname="helv", fontsize=12)
-                lines += max(1, int(tl / max(width - 8, 1)) + 1)
-            rect.y1 = max(rect.y1, rect.y0 + lines * 14.5 + 6)
-            rect.x1 = max(rect.x1, rect.x0 + 40)
-            a = page.add_freetext_annot(rect, text, fontsize=12, fontname="helv", text_color=col,
-                                        fill_color=None, align=0)
-            a.update()
-        else:
-            img, w_pt, h_pt = self._render_text_image(text, max(rect.width, 40), col)
-            rect = pymupdf.Rect(rect.x0, rect.y0, rect.x0 + w_pt, rect.y0 + max(rect.height, h_pt))
-            a = page.add_freetext_annot(rect, " ", fontsize=12, fontname="helv", text_color=(0, 0, 0),
-                                        fill_color=None, align=0)
-            self._set_image_appearance(a, img, rect.width, rect.height)
-            a.set_info(content=text, subject="SuReader-image-text")
-        return a
-
-    def add_textbox(self, i, rect, text):
+    def add_textbox(self, i, rect, model):
         if not self._need_pdf():
             return False
         W, H = self.sizes[i]
@@ -1239,9 +1425,18 @@ class PdfView(QAbstractScrollArea):
         rect.x1, rect.y1 = min(rect.x1, W), min(rect.y1, H)
         with self.op("Text box"):
             page = self.doc[i]
-            self._create_textbox(page, rect, text)
+            self._create_textbox(page, rect, model)
         self._touch([i])
         return True
+
+    def _tb_edit_dialog(self, model, is_new=False):
+        dlg = TextBoxDialog(self, model)
+        if run_exec(dlg) != QDialog.DialogCode.Accepted:
+            return None
+        m = dlg.result_model()
+        if is_new and self.on_tb_defaults is not None:       # only a NEW box changes what the next one starts with
+            self.on_tb_defaults(dlg.text_color, m["bg"], m["size"])
+        return m
 
     def _finish_textbox(self, d):
         i, r = d["page"], d["rect"]
@@ -1249,20 +1444,20 @@ class PdfView(QAbstractScrollArea):
         if r.width < 12 or r.height < 12:                   # a plain click: default size
             x, y = d["p0"]
             r = pymupdf.Rect(x, y, min(x + 220, W), min(y + 50, H))
-        text, ok = QInputDialog.getMultiLineText(self, "Text box", "Text:")
-        if ok and text.strip():
-            self.add_textbox(i, r, text)
+        m = self._tb_edit_dialog(self._tb_default_model(self.tb_defaults), is_new=True)
+        if m is not None and "".join(x["t"] for x in m["runs"]).strip():
+            self.add_textbox(i, r, m)
         self.viewport().update()
 
     def edit_textbox(self, page, annot):
-        old = annot.info.get("content", "")
-        text, ok = QInputDialog.getMultiLineText(self, "Text box", "Edit text:", old)
-        if not ok or not text.strip() or text == old:
+        old = self._tb_model_of(annot)
+        m = self._tb_edit_dialog(old)
+        if m is None or not "".join(x["t"] for x in m["runs"]).strip() or m == old:
             return
         rect, i = pymupdf.Rect(annot.rect), page.number
         with self.op("Edit text box"):
             page.delete_annot(annot)
-            self._create_textbox(page, rect, text)
+            self._create_textbox(page, rect, m)
         self._touch([i])
 
     def edit_textbox_xref(self, i, xref):
@@ -1341,7 +1536,7 @@ class PdfView(QAbstractScrollArea):
                           "strike": page.add_strikeout_annot}[kind]
                     na = fn(quads=rest)
                     if na is not None:
-                        na.set_colors(stroke=colors.get("stroke") or self.colors[kind])
+                        na.set_colors(stroke=colors.get("stroke") or self.pdf_color(kind))
                         if opacity is not None and 0 <= opacity < 1:
                             na.set_opacity(opacity)
                         na.update()
@@ -1632,7 +1827,7 @@ class PdfView(QAbstractScrollArea):
             qr = QRectF(x + rect.x0 * z, y + rect.y0 * z, rect.width * z, rect.height * z)
             p.save()
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setBrush(qcolor(self.colors["highlight"], 70) if self.tool == "highlight" else Qt.BrushStyle.NoBrush)
+            p.setBrush(qcolor(cmyk_rgb(self.colors["highlight"]), 70) if self.tool == "highlight" else Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor(30, 30, 30), 1.2, Qt.PenStyle.DashLine))
             p.drawRect(qr)
             if live:
@@ -1649,7 +1844,7 @@ class PdfView(QAbstractScrollArea):
             p.restore()
         if self._stroke is not None and self._stroke_page == i:
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setPen(QPen(qcolor(self.colors["pen"]), max(1.0, 1.8 * z)))
+            p.setPen(QPen(qcolor(cmyk_rgb(self.colors["pen"])), max(1.0, 1.8 * z)))
             pts = self._stroke
             for a, b in zip(pts, pts[1:]):
                 p.drawLine(QPointF(x + a[0] * z, y + a[1] * z), QPointF(x + b[0] * z, y + b[1] * z))
@@ -1883,6 +2078,11 @@ class BookmarkStore:
 
 class MarkList(QListWidget):
     delete_requested = pyqtSignal()
+    resized = pyqtSignal()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.resized.emit()
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key.Key_Delete:
@@ -1895,11 +2095,15 @@ class ThumbView(QAbstractScrollArea):
     """Page thumbnails. Only the visible cells are drawn and thumbnails are rendered one at a time
     in the background, so even a thousand-page scan neither freezes nor needs seconds to build."""
     page_clicked = pyqtSignal(int)
-    TW, TH = 120, 160
+    TW, TH = 120, 160                # start values; they follow the width of the panel (80 - 400 px)
     CELL_H = TH + 36
 
     def __init__(self):
         super().__init__()
+        self.pix_tw = self.TW            # width the stored thumbnails were rendered at
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.timeout.connect(self._resize_settled)
         self.n = 0
         self.cur = -1
         self.pix = OrderedDict()
@@ -1931,7 +2135,23 @@ class ThumbView(QAbstractScrollArea):
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
+        tw = max(80, min(400, (self.viewport().width() - 24) // 4 * 4))
+        if tw != self.TW:
+            top_page = self.verticalScrollBar().value() / max(1, self.CELL_H)
+            self.TW, self.TH = tw, tw * 4 // 3
+            self.CELL_H = self.TH + 36
+            self.verticalScrollBar().setSingleStep(self.CELL_H // 2)
+            self._update_range()
+            self.verticalScrollBar().setValue(int(top_page * self.CELL_H))
+            self._settle.start(300)              # sharp thumbnails once the border stops moving
         self._update_range()
+        self.viewport().update()
+
+    def _resize_settled(self):
+        self.pix.clear()
+        self.pix_tw = self.TW
+        self.viewport().update()
+        self._sched()
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -1966,6 +2186,7 @@ class ThumbView(QAbstractScrollArea):
             except Exception:
                 pm = None
             self.pix[i] = pm if pm is not None else QPixmap()
+            self.pix_tw = self.TW
             while len(self.pix) > 400:
                 self.pix.popitem(last=False)
             self.viewport().update()
@@ -2007,7 +2228,13 @@ class ThumbView(QAbstractScrollArea):
                 p.fillRect(QRect(3, top + 2, vw - 6, self.CELL_H - 4), hl)
             pm = self.pix.get(i)
             if pm is not None and not pm.isNull():
-                p.drawPixmap((vw - pm.width()) // 2, top + 4, pm)
+                if self.pix_tw != self.TW:               # border is being dragged: scale what we have
+                    s = self.TW / float(self.pix_tw)
+                    w_, h_ = int(pm.width() * s), int(pm.height() * s)
+                    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                    p.drawPixmap(QRect((vw - w_) // 2, top + 4, w_, h_), pm)
+                else:
+                    p.drawPixmap((vw - pm.width()) // 2, top + 4, pm)
             else:
                 box = QRect((vw - self.TW) // 2, top + 4, self.TW, self.TH)
                 p.fillRect(box, QColor(60, 60, 64) if base.lightness() < 100 else QColor(245, 245, 245))
@@ -2059,6 +2286,11 @@ class Sidebar(QObject):
         self._mark_queue = []
         self._mark_gen = 0
         self._mark_icons = {}              # page -> QIcon: bookmark thumbnails are made once
+        self.mark_tw = 120                 # width of a bookmark thumbnail (follows the panel width)
+        self._mark_settle = QTimer(self)
+        self._mark_settle.setSingleShot(True)
+        self._mark_settle.timeout.connect(self._mark_resized)
+        self.marks.resized.connect(lambda: self._mark_settle.start(250))
         self._mark_doc = None
         self._mark_scrolled = 0.0
         self.marks.verticalScrollBar().valueChanged.connect(lambda v: setattr(self, "_mark_scrolled", time.monotonic()))
@@ -2110,14 +2342,17 @@ class Sidebar(QObject):
     def _loaded(self):
         return {k for k, pm in self.thumbs.pix.items() if not pm.isNull()}
 
-    def _thumb_pix(self, i):
-        """Thumbnail of page i as a QPixmap with a thin border (None if it cannot be rendered)."""
+    def _thumb_pix(self, i, tw=None):
+        """Thumbnail of page i as a QPixmap with a thin border (None if it cannot be rendered).
+        `tw` = width in px (default: the current width of the Thumbnails panel)."""
         v = self.view
         if v is None or v.doc is None or not (0 <= i < v.page_count):
             return None
+        tw = tw or self.thumbs.TW
+        th = tw * 4 // 3
         page = v.doc[i]
         r = page.rect
-        z = min(self.TW / max(r.width, 1), self.TH / max(r.height, 1))
+        z = min(tw / max(r.width, 1), th / max(r.height, 1))
         pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
         del page
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
@@ -2152,23 +2387,28 @@ class Sidebar(QObject):
         if doc is not self._mark_doc:                      # another document: old thumbnails are useless
             self._mark_doc = doc
             self._mark_icons = {}
+        tw_now = self._mark_tw_now()
+        if tw_now != self.mark_tw:                         # panel got wider / narrower: new thumbnail size
+            self.mark_tw = tw_now
+            self._mark_icons = {}
+        mtw, mth = self.mark_tw, self.mark_tw * 4 // 3
         if use:
             self.marks.setViewMode(QListView.ViewMode.IconMode)
             self.marks.setFlow(QListView.Flow.TopToBottom)
             self.marks.setWrapping(False)
             self.marks.setMovement(QListView.Movement.Static)
             self.marks.setResizeMode(QListView.ResizeMode.Adjust)
-            self.marks.setIconSize(QSize(self.TW, self.TH))
-            self.marks.setGridSize(QSize(self.TW + 90, self.TH + 64))
+            self.marks.setIconSize(QSize(mtw, mth))
+            self.marks.setGridSize(QSize(max(mtw + 20, self.marks.viewport().width() - 6), mth + 64))
             self.marks.setWordWrap(True)
             self.marks.setUniformItemSizes(True)
             self.marks.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             self.marks.verticalScrollBar().setSingleStep(48)          # smooth wheel: ~150 px per notch
-            ph = QPixmap(self.TW, self.TH)
+            ph = QPixmap(mtw, mth)
             ph.fill(QColor(245, 245, 245))
             pp = QPainter(ph)
             pp.setPen(QColor(150, 150, 150))
-            pp.drawRect(0, 0, self.TW - 1, self.TH - 1)
+            pp.drawRect(0, 0, mtw - 1, mth - 1)
             pp.end()
             ph_icon = QIcon(ph)
         else:
@@ -2191,6 +2431,14 @@ class Sidebar(QObject):
             if self._mark_queue:
                 QTimer.singleShot(20, self._mark_icon_step)
 
+    def _mark_tw_now(self):
+        vw = self.marks.viewport().width()
+        return max(80, min(400, (vw - 40) // 8 * 8))
+
+    def _mark_resized(self):
+        if self.mark_thumbs and self._mark_tw_now() != self.mark_tw and self.marks.count():
+            self._refresh_marks()
+
     def _mark_icon_step(self):
         """Make the bookmark thumbnails one by one: the ones on screen first, and never while the
         list is being scrolled (so scrolling stays smooth)."""
@@ -2208,9 +2456,7 @@ class Sidebar(QObject):
         if it is not None:
             page = it.data(self.UR)
             try:
-                pm = self.thumbs.pix.get(page)
-                if pm is None or pm.isNull():
-                    pm = self._thumb_pix(page)
+                pm = self._thumb_pix(page, self.mark_tw)
                 if pm is not None and gen == self._mark_gen:
                     icon = QIcon(pm)
                     self._mark_icons[page] = icon
@@ -2297,6 +2543,7 @@ class RecentStore:
         self.data.setdefault("widths", {})
         self.data.setdefault("settings", {})
         self.data.setdefault("pins", {})          # pinned books: path -> time pinned
+        self.data.setdefault("session", None)     # {"windows": [{"tabs": [...], "current": n}]}
 
     def _save(self):
         try:
@@ -2344,8 +2591,9 @@ class RecentStore:
 
     SETTING_DEFAULTS = {"wheel_down_in": True, "dark": False,
                         "mark_thumbs": True, "hl_mode": "auto", "open_mode": "tabs",
-                        "color_highlight": "Yellow", "color_underline": "Yellow",
-                        "color_strike": "Yellow", "color_pen": "Yellow", "page_render": 20,
+                        "color_highlight": 0, "color_underline": 0,
+                        "color_strike": 0, "color_pen": 0, "palette": None,
+                        "tb_text": [0, 0, 0, 100], "tb_bg": [0, 0, 0, 0], "tb_size": 100, "page_render": 20, "session_mode": "new",
                         "home_sort": "recent"}
 
     def setting(self, name):
@@ -2353,6 +2601,10 @@ class RecentStore:
 
     def set_setting(self, name, value):
         self.data["settings"][name] = value
+        self._save()
+
+    def set_session(self, sess):
+        self.data["session"] = sess
         self._save()
 
     @property
@@ -2744,6 +2996,346 @@ class FindEdit(QLineEdit):
             super().keyPressEvent(ev)
 
 
+# ============================================================ text box model + dialogs
+_up = getattr(QTextFormat, "UserProperty", None)
+if _up is None:
+    _up = QTextFormat.Property.UserProperty
+UP_CMYK = int(getattr(_up, "value", _up)) + 1          # text colour of a character, exact CMYK "c,m,y,k"
+_BOLD = getattr(QFont, "Bold", None) or QFont.Weight.Bold
+_NORMAL = getattr(QFont, "Normal", None) or QFont.Weight.Normal
+_BOLD_FROM = (int(getattr(_BOLD, "value", _BOLD)) + int(getattr(_NORMAL, "value", _NORMAL))) / 2.0   # Qt5: 62.5, Qt6: 550
+_VA = QTextCharFormat.VerticalAlignment
+VA_NORMAL, VA_SUP, VA_SUB = _VA.AlignNormal, _VA.AlignSuperScript, _VA.AlignSubScript
+
+
+def char_format(r, only=None):
+    """QTextCharFormat of a run. With `only` (a CMYK tuple) every other colour is made invisible."""
+    f = QTextCharFormat()
+    if r["b"]:
+        f.setFontWeight(_BOLD)
+    f.setFontItalic(bool(r["i"]))
+    f.setFontUnderline(bool(r["u"]))
+    f.setFontStrikeOut(bool(r["s"]))
+    f.setVerticalAlignment(VA_SUP if r["v"] == 1 else VA_SUB if r["v"] == -1 else VA_NORMAL)
+    c = tuple(r["c"])
+    if only is None:
+        f.setForeground(qcolor(cmyk_rgb(c)))
+    else:
+        f.setForeground(QColor(0, 0, 0, 255) if c == tuple(only) else QColor(0, 0, 0, 0))
+    f.setProperty(UP_CMYK, ",".join(str(int(x)) for x in c))
+    return f
+
+
+def run_of_format(f, default_c=TB_BLACK):
+    prop = f.property(UP_CMYK)
+    try:
+        c = tuple(int(x) for x in str(prop).split(","))
+        if len(c) != 4:
+            raise ValueError
+    except Exception:
+        c = tuple(default_c)
+    va = f.verticalAlignment()
+    return {"b": 1 if f.fontWeight() >= _BOLD_FROM else 0, "i": 1 if f.fontItalic() else 0,
+            "u": 1 if f.fontUnderline() else 0, "s": 1 if f.fontStrikeOut() else 0,
+            "v": 1 if va == VA_SUP else -1 if va == VA_SUB else 0, "c": c}
+
+
+def doc_from_model(model, px_per_pt, width_px=None, only=None):
+    doc = QTextDocument()
+    font = QFont(QApplication.font())
+    font.setPixelSize(max(4, int(round(TB_BASE_PT * model["size"] / 100.0 * px_per_pt))))
+    doc.setDefaultFont(font)
+    doc.setDocumentMargin(2 * px_per_pt)
+    cur = QTextCursor(doc)
+    for r in model["runs"]:
+        if r["t"]:
+            cur.insertText(r["t"], char_format(r, only))
+    if width_px:
+        doc.setTextWidth(width_px)
+    return doc
+
+
+def model_from_doc(doc, size, bg, default_c=TB_BLACK):
+    runs = []
+    cur = QTextCursor(doc)
+    for pos in range(doc.characterCount() - 1):          # the last character is the end marker
+        cur.setPosition(pos)
+        cur.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+        ch = cur.selectedText()
+        if ch in ("\u2029", "\u2028"):
+            ch = "\n"
+        r = run_of_format(cur.charFormat(), default_c)
+        if runs and all(runs[-1][k] == r[k] for k in ("b", "i", "u", "s", "v", "c")):
+            runs[-1]["t"] += ch
+        else:
+            r["t"] = ch
+            runs.append(r)
+    if not runs:
+        runs = [dict(run_of_format(QTextCharFormat(), default_c), t="")]
+    return {"size": int(size), "bg": tuple(bg) if bg else None, "runs": runs}
+
+
+def model_plain_format(model):
+    """(bold, italic, cmyk) if the whole text has ONE plain format that a normal PDF text box can show
+    (and the text is Latin-1), else None -> the text box must become an image."""
+    text = "".join(r["t"] for r in model["runs"])
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+    seen = set()
+    for r in model["runs"]:
+        if not r["t"].strip():
+            continue
+        if r["u"] or r["s"] or r["v"]:
+            return None
+        seen.add((r["b"], r["i"], tuple(r["c"])))
+    if len(seen) > 1:
+        return None
+    return seen.pop() if seen else (0, 0, tuple(model["runs"][0]["c"]))
+
+
+class CmykPicker(QDialog):
+    """Small colour chooser that only knows CMYK: 28 ready colours (one click) or C, M, Y, K numbers."""
+    HUES = ((100, 0, 0, 0), (0, 100, 0, 0), (0, 0, 100, 0), (0, 100, 100, 0),
+            (100, 0, 100, 0), (100, 100, 0, 0), (0, 0, 0, 100))
+    TINTS = (100, 75, 50, 25)
+
+    def __init__(self, parent, current, allow_none=False, title="Colour"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.value = tuple(current) if current is not None else None
+        lay = QVBoxLayout(self)
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        for r, f in enumerate(self.TINTS):
+            for c, hue in enumerate(self.HUES):
+                col = tuple(int(round(v * f / 100.0)) for v in hue)
+                b = QToolButton()
+                b.setFixedSize(36, 26)
+                b.setIcon(QIcon(swatch_pixmap(col, 30, 20)))
+                b.setIconSize(QSize(30, 20))
+                b.clicked.connect(lambda checked=False, col=col: self._choose(col))
+                grid.addWidget(b, r, c)
+        lay.addLayout(grid)
+        row = QHBoxLayout()
+        self.spins = []
+        for name in "CMYK":
+            row.addWidget(QLabel(name))
+            s = QSpinBox()
+            s.setRange(0, 100)
+            s.setSuffix(" %")
+            s.valueChanged.connect(self._spin_changed)
+            row.addWidget(s)
+            self.spins.append(s)
+        self.preview = QLabel()
+        self.preview.setFixedSize(54, 26)
+        row.addWidget(self.preview)
+        lay.addLayout(row)
+        if allow_none:
+            nb = QPushButton("None (transparent)")
+            nb.clicked.connect(self._choose_none)
+            lay.addWidget(nb)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._load(self.value)
+
+    def _load(self, col):
+        for s, v in zip(self.spins, col if col is not None else (0, 0, 0, 0)):
+            s.blockSignals(True)
+            s.setValue(int(v))
+            s.blockSignals(False)
+        self.preview.setPixmap(swatch_pixmap(col, 54, 26))
+
+    def _choose(self, col):
+        self.value = tuple(col)
+        self.accept()
+
+    def _choose_none(self):
+        self.value = None
+        self.accept()
+
+    def _spin_changed(self):
+        self.value = tuple(s.value() for s in self.spins)
+        self.preview.setPixmap(swatch_pixmap(self.value, 54, 26))
+
+
+class TbEdit(QTextEdit):
+    """The text box editor: Ctrl+B / Ctrl+I / Ctrl+U switch bold / italic / underline."""
+    format_key = pyqtSignal(str)
+
+    def keyPressEvent(self, ev):
+        mods = ev.modifiers()
+        if (mods & Qt.KeyboardModifier.ControlModifier) and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            for key, name in ((Qt.Key.Key_B, "b"), (Qt.Key.Key_I, "i"), (Qt.Key.Key_U, "u")):
+                if ev.key() == key:
+                    self.format_key.emit(name)
+                    ev.accept()
+                    return
+        super().keyPressEvent(ev)
+
+
+class TextBoxDialog(QDialog):
+    """Text box editor: B I U St X2 X2 for the selected text, text size in %, text and background colour."""
+    WARN = "\u26a0 The Text box will turn into an image"
+
+    def __init__(self, parent, model):
+        super().__init__(parent)
+        self.setWindowTitle("Text box")
+        self.setMinimumSize(500, 340)
+        self.size_pct = int(model.get("size", 100))
+        self.bg = tuple(model["bg"]) if model.get("bg") else None
+        self.text_color = tuple(model["runs"][-1]["c"]) if model["runs"] else TB_BLACK
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        bar.setSpacing(3)
+        self.btn = {}
+        for key, label, tip in (("b", "B", "Bold (Ctrl+B)"), ("i", "I", "Italic (Ctrl+I)"),
+                                ("u", "U", "Underline (Ctrl+U)"), ("s", "St", "Strikethrough"),
+                                ("sup", "X\u00b2", "Superscript"), ("sub", "X\u2082", "Subscript")):
+            b = QToolButton()
+            b.setText(label)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.setFixedSize(34, 28)
+            f = b.font()
+            f.setBold(key == "b")
+            f.setItalic(key == "i")
+            f.setUnderline(key == "u")
+            f.setStrikeOut(key == "s")
+            b.setFont(f)
+            b.clicked.connect(lambda checked=False, k=key: self._toggle(k, checked))
+            bar.addWidget(b)
+            self.btn[key] = b
+        self.zoom = QSpinBox()
+        self.zoom.setRange(25, 500)
+        self.zoom.setSingleStep(5)
+        self.zoom.setSuffix(" %")
+        self.zoom.setValue(self.size_pct)
+        self.zoom.setToolTip("Text size (100 % = 12 pt)")
+        self.zoom.valueChanged.connect(self._zoom_changed)
+        bar.addWidget(self.zoom)
+        self.tbtn, self.bbtn = QToolButton(), QToolButton()
+        for b, tip, fn in ((self.tbtn, "Text colour", self._pick_text), (self.bbtn, "Background colour", self._pick_bg)):
+            b.setToolTip(tip)
+            b.setFixedSize(30, 30)
+            b.setIconSize(QSize(24, 24))
+            b.setAutoRaise(True)
+            b.clicked.connect(fn)
+            bar.addWidget(b)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+        self.warn = QLabel(self.WARN)
+        wf = self.warn.font()
+        wf.setPointSizeF(max(7.0, wf.pointSizeF() * 0.85))
+        self.warn.setFont(wf)
+        self.warn.setStyleSheet("color: #c77700;")
+        self.warn.setVisible(False)
+        lay.addWidget(self.warn)
+        self.edit = TbEdit()
+        self.edit.format_key.connect(lambda k: self.btn[k].click())
+        self.edit.setAcceptRichText(False)               # pasted text takes the current format
+        lay.addWidget(self.edit, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        # text
+        self._apply_zoom()
+        cur = QTextCursor(self.edit.document())
+        for r in model["runs"]:
+            if r["t"]:
+                cur.insertText(r["t"], char_format(r))
+        base = dict(model["runs"][-1]) if model["runs"] else {"b": 0, "i": 0, "u": 0, "s": 0, "v": 0}
+        base["c"] = self.text_color
+        self.edit.setCurrentCharFormat(char_format(base))
+        self.edit.moveCursor(QTextCursor.MoveOperation.End)
+        self._paint_bg()
+        self._paint_text_btn()
+        self.edit.cursorPositionChanged.connect(self._sync)
+        self.edit.textChanged.connect(self._update_warn)
+        self._sync()
+        self._update_warn()
+        self.edit.setFocus()
+
+    # -- helpers
+    def _apply_zoom(self):
+        f = QFont(QApplication.font())
+        f.setPixelSize(max(4, int(round(TB_BASE_PT * self.size_pct / 100.0 * 96 / 72.0))))
+        self.edit.document().setDefaultFont(f)
+
+    def _zoom_changed(self, v):
+        self.size_pct = v
+        self._apply_zoom()
+        self._update_warn()
+
+    def _paint_bg(self):
+        pal = self.edit.palette()
+        pal.setColor(QPalette.ColorRole.Base, qcolor(cmyk_rgb(self.bg)) if self.bg else QColor(255, 255, 255))
+        self.edit.setPalette(pal)
+        self.bbtn.setIcon(QIcon(swatch_pixmap(self.bg, 24, 24, round_=True)))
+
+    def _paint_text_btn(self):
+        self.tbtn.setIcon(QIcon(swatch_pixmap(self.text_color, 24, 24, round_=True)))
+
+    def _merge(self, fmt):
+        self.edit.mergeCurrentCharFormat(fmt)
+        self.edit.setFocus()
+
+    def _toggle(self, key, on):
+        f = QTextCharFormat()
+        if key == "b":
+            f.setFontWeight(_BOLD if on else _NORMAL)
+        elif key == "i":
+            f.setFontItalic(on)
+        elif key == "u":
+            f.setFontUnderline(on)
+        elif key == "s":
+            f.setFontStrikeOut(on)
+        elif key == "sup":
+            f.setVerticalAlignment(VA_SUP if on else VA_NORMAL)
+            self.btn["sub"].setChecked(False)
+        elif key == "sub":
+            f.setVerticalAlignment(VA_SUB if on else VA_NORMAL)
+            self.btn["sup"].setChecked(False)
+        self._merge(f)
+        self._update_warn()
+
+    def _pick_text(self):
+        dlg = CmykPicker(self, self.text_color, title="Text colour")
+        if run_exec(dlg) == QDialog.DialogCode.Accepted and dlg.value is not None:
+            self.text_color = dlg.value
+            f = QTextCharFormat()
+            f.setForeground(qcolor(cmyk_rgb(self.text_color)))
+            f.setProperty(UP_CMYK, ",".join(str(int(x)) for x in self.text_color))
+            self._merge(f)
+            self._paint_text_btn()
+            self._update_warn()
+
+    def _pick_bg(self):
+        dlg = CmykPicker(self, self.bg, allow_none=True, title="Background colour")
+        if run_exec(dlg) == QDialog.DialogCode.Accepted:
+            self.bg = dlg.value
+            self._paint_bg()
+
+    def _sync(self):
+        r = run_of_format(self.edit.currentCharFormat(), self.text_color)
+        for k, v in (("b", r["b"]), ("i", r["i"]), ("u", r["u"]), ("s", r["s"]),
+                     ("sup", r["v"] == 1), ("sub", r["v"] == -1)):
+            self.btn[k].setChecked(bool(v))
+        self.text_color = tuple(r["c"])
+        self._paint_text_btn()
+
+    def result_model(self):
+        return model_from_doc(self.edit.document(), self.size_pct, self.bg, self.text_color)
+
+    def _update_warn(self):
+        m = self.result_model()
+        self.warn.setVisible(model_plain_format(m) is None and bool("".join(r["t"] for r in m["runs"]).strip()))
+
+
 class MainWindow(QMainWindow):
     instances = []                 # every open window (window mode opens each PDF in its own)
     _orig_style = None             # the desktop's own style / palette, kept for leaving dark mode
@@ -2761,6 +3353,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBar().installEventFilter(self)          # middle button on a tab closes it
         self.tabs.currentChanged.connect(self._tab_changed)
         self.setCentralWidget(self.tabs)
         self.store = BookmarkStore.shared()
@@ -2834,7 +3427,7 @@ class MainWindow(QMainWindow):
         self.a_closetab = self._act("Close tab", ["Ctrl+W"], lambda: self._close_current())
         self.a_next = self._act("Next tab", ["Ctrl+Tab", "Ctrl+PgDown"], lambda: self._step_tab(1))
         self.a_prev = self._act("Previous tab", ["Ctrl+Shift+Tab", "Ctrl+PgUp"], lambda: self._step_tab(-1))
-        self.a_quit = self._act("Quit", ["Ctrl+Q"], lambda: self.close())
+        self.a_quit = self._act("Quit", ["Ctrl+Q"], lambda: self.quit_all())
         self.a_goto = self._act("Go to page…", ["Ctrl+G"], lambda: self.goto_dialog())
         self.a_copy = self._act("Copy text", ["Ctrl+C"], lambda: v().copy_selection())
         self.a_w = self._act("Fit width", ["Ctrl+3"], lambda: v().fit_width())
@@ -2876,6 +3469,7 @@ class MainWindow(QMainWindow):
         self.a_zoomspeed = self._act("Zoom speed…", None, lambda: self.zoom_speed_dialog())
         self.a_about = self._act("About", None, lambda: self.about_dialog())
         self.a_pagerender = self._act("Page render…", None, lambda: self.page_render_dialog())
+        self.a_colors = self._act("Colors…", None, lambda: self.colors_dialog())
         self.home_group = QActionGroup(self)
         self.home_actions = {}
         for key, label in (("frequent", "Frequently read"), ("recent", "Recent read")):
@@ -2915,6 +3509,14 @@ class MainWindow(QMainWindow):
             self.open_group.addAction(a)
             self.open_actions[key] = a
         self.open_actions[R.setting("open_mode")].setChecked(True)
+        self.session_group = QActionGroup(self)
+        self.session_actions = {}
+        for key, label in (("new", "Start new session"), ("restore", "Restore previous session"),
+                           ("ask", "Ask every time upon opening")):
+            a = self._act(label, None, lambda checked=False, k=key: self.recent.set_setting("session_mode", k), True)
+            self.session_group.addAction(a)
+            self.session_actions[key] = a
+        self.session_actions[R.setting("session_mode")].setChecked(True)
         self.a_bookmark = self._act("Add bookmark…", ["Ctrl+D"], lambda: self._add_bookmark())
         self.mode_group = QActionGroup(self)
         self.mode_actions = {}
@@ -2960,17 +3562,10 @@ class MainWindow(QMainWindow):
         self.color_actions = {}
         for kind in COLOR_KINDS:
             sub = m.addMenu(KIND_LABELS[kind])
-            grp = QActionGroup(self)
-            grp.setExclusive(True)
-            acts = {}
-            for name, rgb in COLORS:
-                a = QAction(name, self)
-                a.setCheckable(True)
-                a.triggered.connect(lambda checked=False, k=kind, n=name: self._set_kind_color(k, n))
-                grp.addAction(a)
-                sub.addAction(a)
-                acts[name] = a
-            self.color_actions[kind] = acts
+            items = []
+            for slot in range(SLOTS):                  # only a colour swatch, no name
+                items.append(swatch_action(sub, TB_WHITE, lambda k=kind, s=slot: self._set_kind_slot(k, s)))
+            self.color_actions[kind] = items
         m.addAction(self.tool_actions["note"])
         m.addAction(self.tool_actions["textbox"])
         m.addSeparator()
@@ -2983,6 +3578,10 @@ class MainWindow(QMainWindow):
         for a in self.open_actions.values():
             sub.addAction(a)
         m.addAction(self.a_pagerender)
+        sub = m.addMenu("Session")
+        for a in self.session_actions.values():
+            sub.addAction(a)
+        m.addAction(self.a_colors)
         m.addSeparator()
         m.addAction(self.a_zoomspeed)
         sub = m.addMenu("Mouse wheel zoom")
@@ -3393,27 +3992,48 @@ class MainWindow(QMainWindow):
         else:
             d.close()                      # -> _panel_closed() saves the state
 
-    def _color_rgb(self, kind):
-        return COLOR_BY_NAME.get(self.recent.setting("color_" + kind), COLORS[0][1])
+    # ------------------------------------------------------------------ colours (all CMYK)
+    def _palette(self):
+        saved = self.recent.setting("palette")
+        out = {}
+        for k in COLOR_KINDS:
+            row = saved.get(k) if isinstance(saved, dict) else None
+            if not (isinstance(row, list) and len(row) == SLOTS):
+                row = DEFAULT_PALETTE[k]
+            out[k] = [tuple(int(x) for x in c) for c in row]
+        return out
 
-    def _set_kind_color(self, kind, name):
-        """Remember `name` as the colour of highlight / underline / strikeout / pen (all windows)."""
-        if name not in COLOR_BY_NAME:
-            return
-        self.recent.set_setting("color_" + kind, name)
+    def _slot(self, kind):
+        v = self.recent.setting("color_" + kind)
+        if isinstance(v, str):                                   # older versions stored a colour name
+            v = OLD_COLOR_NAMES.index(v) if v in OLD_COLOR_NAMES else 0
+        return v if isinstance(v, int) and 0 <= v < SLOTS else 0
+
+    def _cmyk_of(self, kind):
+        return self._palette()[kind][self._slot(kind)]
+
+    def _apply_colors(self):
         for v in self._all_views():
-            v.colors[kind] = COLOR_BY_NAME[name]
+            for kind in COLOR_KINDS:
+                v.colors[kind] = self._cmyk_of(kind)
         self._sync_color_checks()
 
-    def _sync_color_checks(self):
-        for kind, acts in self.color_actions.items():
-            cur = self.recent.setting("color_" + kind)
-            acts[cur if cur in acts else COLORS[0][0]].setChecked(True)
+    def _set_kind_slot(self, kind, slot):
+        """Remember which of the 7 colours highlight / underline / strikeout / pen uses (all windows)."""
+        self.recent.set_setting("color_" + kind, int(slot))
+        self._apply_colors()
 
-    def _menu_color(self, view, kind, name):
+    def _sync_color_checks(self):
+        pal = self._palette()
+        for kind, acts in self.color_actions.items():
+            cur = self._slot(kind)
+            for i, item in enumerate(acts):
+                item.set_state(pal[kind][i], i == cur)
+
+    def _menu_color(self, view, kind, slot):
         """Right-click menu: pick a colour. It becomes the tool's colour (shown with a tick in
         Edit) and, if text is selected, is applied to it right away. No tool is switched on."""
-        self._set_kind_color(kind, name)
+        self._set_kind_slot(kind, slot)
         if view is None or view.doc is None:
             return
         if kind == "highlight" and view.rect_sel is not None:
@@ -3421,21 +4041,83 @@ class MainWindow(QMainWindow):
         elif kind in MARKUP and view.sel:
             view.markup_selection(kind)
 
+    def _save_tb_defaults(self, text, bg, size):
+        """The last text colour / background / size used in the text box editor start the next box."""
+        self.recent.set_setting("tb_text", list(text))
+        self.recent.set_setting("tb_bg", list(bg) if bg else None)
+        self.recent.set_setting("tb_size", int(size))
+        for v in self._all_views():
+            v.tb_defaults = {"text": tuple(text), "bg": tuple(bg) if bg else None, "size": int(size)}
+
+    def colors_dialog(self):
+        """Settings > Colors: the 7 colours of every tool, all CMYK."""
+        work = {k: [tuple(c) for c in v] for k, v in self._palette().items()}
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Colors")
+        lay = QVBoxLayout(dlg)
+        info = QLabel("All colours are CMYK, so the printed page has the same inks as the screen.\n"
+                      "Click a colour to change it (28 ready colours, or your own C, M, Y, K numbers).")
+        lay.addWidget(info)
+        grid = QGridLayout()
+        btns = {}
+        for c, kind in enumerate(COLOR_KINDS):
+            grid.addWidget(QLabel("<b>%s</b>" % KIND_LABELS[kind]), 0, c)
+            for s in range(SLOTS):
+                b = QToolButton()
+                b.setFixedSize(92, 28)
+                b.setIconSize(QSize(84, 20))
+                grid.addWidget(b, s + 1, c)
+                btns[(kind, s)] = b
+
+                def pick(checked=False, kind=kind, s=s):
+                    p = CmykPicker(dlg, work[kind][s], title="Colour")
+                    if run_exec(p) == QDialog.DialogCode.Accepted and p.value is not None:
+                        work[kind][s] = p.value
+                        refresh()
+                b.clicked.connect(pick)
+        lay.addLayout(grid)
+
+        def refresh():
+            for (kind, s), b in btns.items():
+                b.setIcon(QIcon(swatch_pixmap(work[kind][s], 84, 20)))
+
+        def reset():
+            for kind in COLOR_KINDS:
+                work[kind] = [tuple(c) for c in DEFAULT_PALETTE[kind]]
+            refresh()
+        refresh()
+        row = QHBoxLayout()
+        rb = QPushButton("Reset to default")
+        rb.clicked.connect(reset)
+        row.addWidget(rb)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        row.addWidget(bb)
+        lay.addLayout(row)
+        if run_exec(dlg) == QDialog.DialogCode.Accepted:
+            self.recent.set_setting("palette", {k: [list(c) for c in v] for k, v in work.items()})
+            self._apply_colors()
+
     FEATURES = (
         "Simple, compact design (SumatraPDF style) - one ribbon, nothing in the way",
         "Dark mode for the interface - pages always keep their real colours",
         "Home overview: your recent (or most opened) books with thumbnails",
         "Pin book: keep a book on the Home page for as long as the user wants",
         "Mouse zoom: hold the right button and turn the wheel - zooms at the pointer (SumatraPDF inspired)",
-        "Tabbed view, or one window per PDF (Tab mode / Window mode)",
+        "Tabbed view (middle click closes a tab), or one window per PDF (Tab mode / Window mode)",
         "Page render slider (Settings): choose how much of a big book is kept ready for smooth scrolling",
         "Single page, facing (two pages) and book view; the layout is remembered per file",
-        "Highlight, underline, strikeout, pen, note and text box - each tool has its own colour",
+        "Highlight, underline, strikeout, pen, note and text box - each tool has its own 7 colours",
+        "All colours are CMYK (Settings > Colors): the printed page has exactly the inks you chose",
+        "Text box editor: bold, italic, underline, strikethrough, super/subscript on the selected text, text size, text and background colour",
+        "Session: start new, restore the previous session, or ask every time you open SuReader",
         "Colour menus in Edit and in the right-click menu; text is marked straight from the right-click menu",
         "Undo / Redo for every annotation change",
-        "Text boxes with full Unicode text, Bengali included",
+        "Text boxes with full Unicode text, Bengali included (saved as an image, the editor tells you)",
         "Find with next / previous, with all hits marked",
-        "Outline, thumbnails and bookmarks panels (bookmarks can show page thumbnails)",
+        "Outline, thumbnails and bookmarks panels; thumbnails grow and shrink with the panel width",
         "Clickable links, with Go back (Alt+Left)",
         "Save / Save as, with a question before replacing the original file",
         "Damaged PDFs are repaired in memory so they can still be read",
@@ -3547,7 +4229,11 @@ class MainWindow(QMainWindow):
         R = self.recent
         v.wheel_down_in = R.setting("wheel_down_in")
         v.hl_mode = R.setting("hl_mode")
-        v.colors = {k: self._color_rgb(k) for k in COLOR_KINDS}
+        v.colors = {k: self._cmyk_of(k) for k in COLOR_KINDS}
+        tb_bg = self.recent.setting("tb_bg")
+        v.tb_defaults = {"text": tuple(self.recent.setting("tb_text")), "bg": tuple(tb_bg) if tb_bg else None,
+                         "size": int(self.recent.setting("tb_size"))}
+        v.on_tb_defaults = self._save_tb_defaults
         v.set_dark(R.setting("dark"))
         v.render_pct = R.setting("page_render")
 
@@ -3565,6 +4251,7 @@ class MainWindow(QMainWindow):
         self.hl_actions[R.setting("hl_mode")].setChecked(True)
         self.open_actions[R.setting("open_mode")].setChecked(True)
         self.home_actions[R.setting("home_sort")].setChecked(True)
+        self.session_actions[R.setting("session_mode")].setChecked(True)
         self._sync_color_checks()
 
     def _apply_tab_chrome(self):
@@ -3583,6 +4270,75 @@ class MainWindow(QMainWindow):
                 self, "Window mode",
                 "From now on every PDF opens in its own window.\n\n"
                 "The Tabs bar and the Tabs button disappear the next time SuReader is started.")
+
+    # ------------------------------------------------------------------ session
+    _closed_burst = []            # (time, window session) of windows closed one after the other
+
+    def _window_session(self):
+        tabs, cur = [], 0
+        for i in range(self.tabs.count()):
+            v = self.tabs.widget(i)
+            if v.doc is not None and v.path and os.path.isfile(v.path):
+                if i == self.tabs.currentIndex():
+                    cur = len(tabs)
+                tabs.append({"path": os.path.realpath(v.path), "page": v.current_page(),
+                             "fit": v.fit, "zoom": round(v.zoom, 4)})
+        return {"tabs": tabs, "current": cur}
+
+    @staticmethod
+    def session_all():
+        wins = [w._window_session() for w in MainWindow.instances]
+        return [w for w in wins if w["tabs"]]
+
+    def quit_all(self):
+        """Quit: remember every open window, then close them all."""
+        snap = MainWindow.session_all()
+        for win in list(MainWindow.instances):
+            if not win.close():
+                return                                   # a window kept open (unsaved changes): not quitting
+        self.recent.set_session({"windows": snap})
+
+    def _apply_entry(self, v, e):
+        if v is None or v.doc is None:
+            return
+        if e.get("fit") in ("width", "page"):
+            (v.fit_width if e["fit"] == "width" else v.fit_page)()
+        elif e.get("zoom"):
+            v.set_zoom(float(e["zoom"]))
+        v.goto_page(int(e.get("page", 0)))
+
+    def restore_session(self, sess):
+        """Open the documents of a saved session again (tab order, page and zoom)."""
+        for wi, wd in enumerate(sess.get("windows", [])):
+            target = self if wi == 0 else self._new_window()
+            cur_view = None
+            for k, e in enumerate(wd.get("tabs", [])):
+                if not os.path.isfile(e.get("path", "")):
+                    continue                              # moved / deleted: just skip it
+                target.open_file(e["path"])
+                real = os.path.realpath(e["path"])
+                for win in MainWindow.instances:
+                    for i in range(win.tabs.count()):
+                        v = win.tabs.widget(i)
+                        if v.path and os.path.realpath(v.path) == real:
+                            self._apply_entry(v, e)
+                            if k == wd.get("current", 0):
+                                cur_view = (win, v)
+            if cur_view is not None:
+                win, v = cur_view
+                win.tabs.setCurrentIndex(win.tabs.indexOf(v))
+
+    def ask_restore(self, sess):
+        names = [os.path.basename(e["path"]) for w in sess.get("windows", []) for e in w.get("tabs", [])]
+        box = QMessageBox(self)
+        box.setWindowTitle("Session")
+        box.setText("Restore the previous session?")
+        box.setInformativeText("%d document(s) were open when SuReader was closed." % len(names))
+        box.setDetailedText("\n".join(names))
+        yes = box.addButton("Restore previous session", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Start new session", QMessageBox.ButtonRole.RejectRole)
+        run_exec(box)
+        return box.clickedButton() is yes
 
     def _new_window(self):
         w = MainWindow()
@@ -4010,13 +4766,23 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         for kind in COLOR_KINDS:
             sub = m.addMenu(KIND_LABELS[kind])
-            for name, rgb in COLORS:
-                sub.addAction(name, lambda checked=False, k=kind, n=name: self._menu_color(view, k, n))
+            pal = self._palette()[kind]
+            for slot in range(SLOTS):
+                swatch_action(sub, pal[slot], lambda k=kind, s=slot: self._menu_color(view, k, s))
         m.addAction("Note", lambda checked=False: view.note_at(pos))
         m.addAction("Textbox", lambda checked=False: view.textbox_at(pos))
         m.addSeparator()
         m.addAction(self.a_fs)
         return m
+
+    def eventFilter(self, obj, ev):
+        if (obj is self.tabs.tabBar() and ev.type() == QEvent.Type.MouseButtonRelease
+                and ev.button() == Qt.MouseButton.MiddleButton):
+            i = obj.tabAt(ev_pos(ev))
+            if i >= 0:
+                self.close_tab(i)
+                return True
+        return super().eventFilter(obj, ev)
 
     def closeEvent(self, ev):
         for i in range(self.tabs.count()):
@@ -4025,8 +4791,25 @@ class MainWindow(QMainWindow):
                 return
         for i in range(self.tabs.count()):
             self.tabs.widget(i).modified = False
+        entry = self._window_session()
+        now = time.monotonic()
+        if entry["tabs"]:
+            MainWindow._closed_burst.append((now, entry))
         if self in MainWindow.instances:
             MainWindow.instances.remove(self)
+        if not MainWindow.instances:
+            # last window: the session is this window plus the windows closed right before it
+            # (closing them one after the other counts as one shutdown)
+            wins, last = [], now
+            for t, e in reversed(MainWindow._closed_burst):
+                if last - t <= 10:
+                    wins.append(e)
+                    last = t
+                else:
+                    break
+            wins.reverse()
+            MainWindow._closed_burst = []
+            self.recent.set_session({"windows": wins})
         ev.accept()
 
     def dragEnterEvent(self, ev):
@@ -4058,7 +4841,13 @@ def main():
     w = MainWindow()
     w.show()
     w.resizeDocks([w.docks["outline"]], [340], Qt.Orientation.Horizontal)
-    for p in sys.argv[1:]:
+    sess = w.recent.data.get("session")
+    mode = w.recent.setting("session_mode")
+    has = bool(sess) and any(os.path.isfile(e.get("path", "")) for wd in sess.get("windows", [])
+                             for e in wd.get("tabs", []))
+    if has and (mode == "restore" or (mode == "ask" and w.ask_restore(sess))):
+        w.restore_session(sess)
+    for p in sys.argv[1:]:                          # a file given on the command line is always opened
         w.open_file(p)
     sys.exit(run_exec(app))
 
