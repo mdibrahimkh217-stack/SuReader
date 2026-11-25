@@ -23,9 +23,9 @@ Run:           python3 sureader.py [a.pdf b.pdf ...]
 * Links           click internal / http(s) links;  Alt+Left goes back
 * Save            Ctrl+S asks "save to this same file?" (Yes = replace, No = choose another file);
                   Ctrl+Shift+S save as;  closing a tab/app with unsaved annotations asks too
+* Menu button     left end of the ribbon: File, View, Edit, Settings
 * Tabs button     right end of the ribbon: drop-down list of all open tabs
 * Settings > Opening PDFs: tab mode (default) or window mode (each PDF in its own window, no tab bar)
-* Settings > Page render: 1-100 % of the book kept rendered around the page you read (half behind, half ahead)
 * Settings > Colors: 7 CMYK colours for each of highlight / underline / strikeout / pen
 * Settings > Session: start new / restore the previous session / ask every time
 * View            Ctrl+1 actual size  Ctrl+2 fit page  Ctrl+3 fit width  Ctrl+= / Ctrl+-
@@ -37,6 +37,7 @@ import platform
 import re
 import gc
 import json
+import bisect
 import math
 import contextlib
 import time
@@ -56,28 +57,37 @@ try:
     from PyQt6.QtGui import (QImage, QPainter, QColor, QAction, QActionGroup,
                              QKeySequence, QPen, QPixmap, QIcon, QDesktopServices, QPalette, QFont,
                              QFontMetrics, QIntValidator, QTextDocument, QTextCursor, QTextCharFormat,
-                             QTextFormat)
+                             QTextFormat, QTextBlockFormat, QFontMetricsF)
     from PyQt6.QtWidgets import (
         QAbstractScrollArea, QApplication, QComboBox, QFileDialog, QInputDialog,
         QLineEdit, QMainWindow, QMenu, QMessageBox, QTabWidget, QToolBar,
         QDockWidget, QListView, QListWidget, QListWidgetItem, QTreeWidget,
         QTreeWidgetItem, QLabel, QFrame, QGridLayout, QVBoxLayout, QScrollArea, QWidget,
         QToolButton, QSizePolicy, QDialog, QTextBrowser, QDialogButtonBox, QSlider, QHBoxLayout,
-        QAbstractItemView, QTextEdit, QSpinBox, QPushButton, QWidgetAction)
+        QAbstractItemView, QTextEdit, QSpinBox, QPushButton, QWidgetAction, QPlainTextEdit)
 except ImportError:                      # Qt5 (older distros, e.g. glibc < 2.33)
     from PyQt5.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, QPoint, QRect, QObject, QUrl,
                               pyqtSignal, QEvent)
     from PyQt5.QtGui import (QImage, QPainter, QColor, QKeySequence, QPen,
                              QPixmap, QIcon, QDesktopServices, QPalette, QFont,
                              QFontMetrics, QIntValidator, QTextDocument, QTextCursor, QTextCharFormat,
-                             QTextFormat)
+                             QTextFormat, QTextBlockFormat, QFontMetricsF)
     from PyQt5.QtWidgets import (
         QAbstractScrollArea, QApplication, QComboBox, QFileDialog, QInputDialog,
         QLineEdit, QMainWindow, QMenu, QMessageBox, QTabWidget, QToolBar,
         QAction, QActionGroup, QDockWidget, QListView, QListWidget,
         QListWidgetItem, QTreeWidget, QTreeWidgetItem, QLabel, QFrame, QGridLayout,
         QVBoxLayout, QScrollArea, QWidget, QToolButton, QSizePolicy, QDialog, QTextBrowser,
-        QDialogButtonBox, QSlider, QHBoxLayout, QAbstractItemView, QTextEdit, QSpinBox, QPushButton, QWidgetAction)
+        QDialogButtonBox, QSlider, QHBoxLayout, QAbstractItemView, QTextEdit, QSpinBox, QPushButton, QWidgetAction, QPlainTextEdit)
+
+
+try:                                      # one running SuReader: a second start hands its files over
+    try:
+        from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+    except ImportError:
+        from PyQt5.QtNetwork import QLocalServer, QLocalSocket
+except Exception:                         # pragma: no cover
+    QLocalServer = QLocalSocket = None
 
 
 try:                                      # printing is optional
@@ -125,6 +135,14 @@ DEFAULT_PALETTE = {k: [(0, 0, 100, 0), (0, 100, 100, 0), (100, 0, 100, 0), (0, 5
 NOTE_COLOR = (0.0, 0.0, 1.0, 0.0)          # notes are yellow
 TB_BASE_PT = 12.0                          # text box text size at 100 %
 TB_BLACK, TB_WHITE = (0, 0, 0, 100), (0, 0, 0, 0)
+_FH = getattr(QTextBlockFormat, "FixedHeight", None)          # Qt5 / Qt6 enum spelling
+if _FH is None:
+    _FH = QTextBlockFormat.LineHeightTypes.FixedHeight
+_FHV = getattr(_FH, "value", _FH)
+# How the smooth scrolling feels (lines are in tenths: 40 = 4.0 lines; times in ms)
+SMOOTH_DEFAULTS = {"sm_wheel_lines": 40, "sm_wheel_ms": 400,
+                   "sm_arrow_lines": 25, "sm_arrow_ms": 170, "sm_arrow_run": 100,
+                   "sm_page_ms": 445, "sm_page_pct": 90, "sm_jump_screens": 4}
 MARKUP_TYPES = {"highlight": "Highlight", "underline": "Underline", "strike": "StrikeOut"}
 MARKUP_LABELS = {"highlight": "highlight", "underline": "underline", "strike": "strikeout"}
 HANDLE_CURSORS = {"n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
@@ -219,12 +237,12 @@ def close_popups():
 
 
 class SwatchItem(QWidget):
-    """A menu row that shows only a colour (no name); the selected one carries a check mark."""
+    """A narrow menu row: only a round colour (no name); the selected one has a check mark beside it."""
 
     def __init__(self, cmyk, callback, tick=False):
         super().__init__()
         self.cmyk, self.cb, self.tick, self._hover = cmyk, callback, tick, False
-        self.setFixedSize(124, 24)
+        self.setFixedSize(66, 28)
         self.setMouseTracking(True)
 
     def set_state(self, cmyk, tick):
@@ -241,11 +259,17 @@ class SwatchItem(QWidget):
 
     def paintEvent(self, ev):
         p = QPainter(self)
+        pal = self.palette()
         if self._hover:
-            c = self.palette().color(QPalette.ColorRole.Highlight)
+            c = pal.color(QPalette.ColorRole.Highlight)
             c.setAlpha(110)
             p.fillRect(self.rect(), c)
-        p.drawPixmap(6, 4, swatch_pixmap(self.cmyk, self.width() - 12, self.height() - 8, self.tick))
+        p.drawPixmap(10, 4, swatch_pixmap(self.cmyk, 20, 20, round_=True))
+        if self.tick:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(QPen(pal.color(QPalette.ColorRole.Text), 2))
+            p.drawLine(QPointF(40, 14), QPointF(44.5, 18.5))
+            p.drawLine(QPointF(44.5, 18.5), QPointF(53, 9.5))
         p.end()
 
     def mouseReleaseEvent(self, ev):
@@ -264,6 +288,119 @@ def swatch_action(menu, cmyk, callback, tick=False):
 
 def qcolor(rgb, alpha=255):
     return QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255), alpha)
+
+
+def trash_icon(size=20, light=False):
+    pm = QPixmap(size, size)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    s = size / 20.0
+    p.setPen(QPen(QColor(245, 245, 245) if light else QColor(60, 60, 70), 1.5 * s))     # white in dark mode
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawLine(QPointF(4 * s, 5.5 * s), QPointF(16 * s, 5.5 * s))                  # lid
+    p.drawLine(QPointF(8 * s, 5.5 * s), QPointF(8 * s, 3.5 * s))
+    p.drawLine(QPointF(8 * s, 3.5 * s), QPointF(12 * s, 3.5 * s))
+    p.drawLine(QPointF(12 * s, 3.5 * s), QPointF(12 * s, 5.5 * s))
+    p.drawRect(QRectF(5.5 * s, 5.5 * s, 9 * s, 11 * s))                              # bin
+    p.drawLine(QPointF(8.5 * s, 8 * s), QPointF(8.5 * s, 14 * s))
+    p.drawLine(QPointF(11.5 * s, 8 * s), QPointF(11.5 * s, 14 * s))
+    p.end()
+    return QIcon(pm)
+
+
+class TbEditor(QTextEdit):
+    """Types a text box right on the page: plain text, no wrapping, transparent.
+    Esc keeps the text. The page code makes it exactly as big as its text."""
+    finished = pyqtSignal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._closing = False
+        self.hold = False                 # a click on the frame / handle: keep typing
+        self.busy = False                 # the colour window is open
+        self.setAcceptRichText(False)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.viewport().setAutoFillBackground(False)
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape:
+            self.finished.emit()
+            return
+        super().keyPressEvent(ev)
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        if self._closing:
+            return
+        if ev.reason() in (Qt.FocusReason.ActiveWindowFocusReason, Qt.FocusReason.PopupFocusReason):
+            return                                   # another window / the colour dialog: keep editing
+        QTimer.singleShot(0, self._focus_lost)       # (a click on the frame arrives a moment later)
+
+    def _focus_lost(self):
+        if self._closing or self.busy:
+            return
+        if self.hold:
+            self.hold = False
+            self.setFocus()
+            return
+        if not self.hasFocus():
+            self.finished.emit()
+
+
+class TbPill(QFrame):
+    """The small bar above a text box being typed: text colour and delete."""
+    color_clicked = pyqtSignal()
+    delete_clicked = pyqtSignal()
+    grabbed = pyqtSignal()                # the mouse went down on the bar: the box keeps being edited
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("tbpill")
+        self.setStyleSheet("#tbpill { background: palette(window); border: 1px solid palette(mid); border-radius: 13px; }")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setSpacing(8)
+        self._cmyk = None
+        self.color_btn = QToolButton()
+        self.color_btn.setFixedSize(26, 26)
+        self.color_btn.setIconSize(QSize(22, 22))
+        self.color_btn.setAutoRaise(True)
+        self.color_btn.setToolTip("Text colour")
+        self.color_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.color_btn.clicked.connect(lambda checked=False: self.color_clicked.emit())
+        self.del_btn = QToolButton()
+        self.del_btn.setFixedSize(26, 26)
+        self.del_btn.setIconSize(QSize(20, 20))
+        self.del_btn.setAutoRaise(True)
+        self.del_btn.setIcon(trash_icon(20))
+        self.del_btn.setToolTip("Delete the text box")
+        self.del_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.del_btn.clicked.connect(lambda checked=False: self.delete_clicked.emit())
+        for w_ in (self.color_btn, self.del_btn):
+            w_.pressed.connect(self.grabbed.emit)
+            lay.addWidget(w_)
+        self.hide()
+
+    def mousePressEvent(self, ev):
+        self.grabbed.emit()
+        super().mousePressEvent(ev)
+
+    def set_dark(self, dark):
+        dark = bool(dark)
+        if dark != getattr(self, "_dark", None):
+            self._dark = dark
+            self.del_btn.setIcon(trash_icon(20, dark))
+
+    def set_values(self, cmyk):
+        cmyk = tuple(cmyk)
+        if cmyk != self._cmyk:
+            self._cmyk = cmyk
+            self.color_btn.setIcon(QIcon(swatch_pixmap(cmyk, 22, 22, round_=True)))
 
 
 class PdfView(QAbstractScrollArea):
@@ -290,8 +427,13 @@ class PdfView(QAbstractScrollArea):
         self.cache = OrderedDict()
         self.last = {}
         self.words_cache = {}
+        self._ft_cache = {}
         self._fast = False
         self._right_zoomed = False
+        self._render_ms = 0.0              # how long a page takes to draw (scans: 150+ ms), moving average
+        self._rpan = None                  # right button held: the page moves like with the hand
+        self._rstart = None
+        self._rmoved = False
         self._pan = None
         self._press = None
         self._moved = False
@@ -304,12 +446,31 @@ class PdfView(QAbstractScrollArea):
         self._rect_drag = None
         self.tool = "hand"
         self.colors = {k: DEFAULT_PALETTE[k][0] for k in COLOR_KINDS}     # CMYK % of each tool
-        self.tb_defaults = {"text": TB_BLACK, "bg": TB_WHITE, "size": 100}     # for new text boxes
+        self.tb_defaults = {"c": TB_BLACK, "fs": 14.0}          # colour / size a new text box starts with
         self.on_tb_defaults = None
-        self.render_pct = 20               # Settings > Page render: % of the book kept rendered around the view
+        self._tb_drag = None               # move / scale of the box being edited
+        self._tb_new = None                # Textbox tool pressed: where the new box starts
+        self._tb_cur = False               # a text box cursor is showing
+        self._tb_busy = False
+        self.smooth_scroll = True          # the mouse wheel glides instead of jumping
+        self.sm = SMOOTH_DEFAULTS          # how it feels (fixed)
+        self._sm_target = None
+        self._sm_last = None
+        self._sm_prev = None
+        self._sm_timer = QTimer(self)
+        self._sm_timer.setInterval(15)
+        self._sm_timer.setSingleShot(True)             # re-armed after every step: no ticks pile up when drawing is slow
+        self._sm_timer.timeout.connect(self._smooth_step)
+        self._tb_edit = None               # text being typed right on the page
+        self._tb_editor = None
+        self._tb_clean = None              # page picture without the box while it is edited
+        self._tb_pill = None
+        self._over_box = False
+        self._ft_cache = {}
+        self.render_pct = 5                # % of the book kept rendered around the view (fixed: 5 % for every PDF)
         self.menu_factory = None
         self.zoom_pct = 10        # % zoom change per wheel notch
-        self.wheel_down_in = True  # wheel down = zoom in (False: wheel up = zoom in)
+        self.wheel_down_in = False  # fixed: wheel up = zoom in, wheel down = zoom out (+/-)
         self.hl_mode = "auto"      # highlight tool: "rect" | "text" | "auto"
         self.dark = False
         self._pw = None
@@ -488,6 +649,7 @@ class PdfView(QAbstractScrollArea):
         """Safely write the in-memory document (including annotations) to `path`.
         Written to a temporary file next to the target, verified, and only then moved over
         the target, so a failed or corrupt write can never damage an existing file."""
+        self._tb_end_edit(True)                                  # a text box still being typed
         folder = os.path.dirname(os.path.abspath(path))
         tmp = os.path.join(folder, ".%s.sureader-tmp" % os.path.basename(path))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -611,6 +773,7 @@ class PdfView(QAbstractScrollArea):
             return ""
 
     def _journal_step(self, direction):
+        self._tb_end_edit(True)
         if direction < 0 and not self.can_undo():
             return False
         if direction > 0 and not self.can_redo():
@@ -655,6 +818,8 @@ class PdfView(QAbstractScrollArea):
     def _relayout(self):
         if not self.sizes:
             return
+        if getattr(self, "_sm_timer", None) is not None:
+            self._smooth_stop()
         z = self.zoom
         widths, heights = [], []
         for row in self.rows:
@@ -714,6 +879,7 @@ class PdfView(QAbstractScrollArea):
         if not self.sizes:
             return
         new_zoom = max(MIN_Z, min(MAX_Z, new_zoom))
+        self._smooth_stop()                           # a glide aims at pixels of the old zoom: let go of it
         if anchor is None:
             anchor = (self.viewport().width() // 2, self.viewport().height() // 2)
         mx, my = anchor
@@ -730,7 +896,7 @@ class PdfView(QAbstractScrollArea):
 
     def zoom_by(self, factor, anchor=None):
         self._fast = True
-        self.settle.start()
+        self.settle.start(int(self._quiet() * 1000) + 20)
         self.set_zoom(self.zoom * factor, anchor)
 
     def _fit_zoom(self, cur):
@@ -811,7 +977,24 @@ class PdfView(QAbstractScrollArea):
                 out += [i for i in self.rows[r] if i >= 0]
         return out
 
+    def _note_render(self, t0):
+        ms = (time.perf_counter() - t0) * 1000.0
+        self._render_ms = ms if self._render_ms == 0.0 else 0.6 * self._render_ms + 0.4 * ms
+
+    def _quiet(self):
+        """How long the user must have stopped scrolling / zooming before sharp pages are drawn. Heavy
+        (scanned) pages take 150+ ms each and block the window while they draw, so they wait longer."""
+        return 0.12 if self._render_ms < 70 else 0.40
+
+    def _prefetch_half(self):
+        """Pages drawn ahead on each side while idle: fewer when every page is slow to draw."""
+        h = self.render_half()
+        if self._render_ms > 60:
+            h = min(h, max(1, int(400 / self._render_ms)))
+        return h
+
     def _render_exact(self, i, key, z, dpr):
+        t0 = time.perf_counter()
         try:
             pix = self.doc[i].get_pixmap(matrix=pymupdf.Matrix(z * dpr, z * dpr), alpha=False)
             img = self._qimage(pix)
@@ -819,6 +1002,7 @@ class PdfView(QAbstractScrollArea):
             img = QImage(8, 8, QImage.Format.Format_RGB32)       # unreadable page: don't retry forever
             img.fill(QColor("white"))
         self.cache[key] = img
+        self._note_render(t0)
         self._trim_cache()
         self.last[i] = (z, img)
 
@@ -840,6 +1024,7 @@ class PdfView(QAbstractScrollArea):
             del self.cache[k]
 
     def _render_low(self, i, z, dpr):
+        t0 = time.perf_counter()
         s_ = max(0.12, min(z * 0.3, 0.6))
         try:
             pix = self.doc[i].get_pixmap(matrix=pymupdf.Matrix(s_, s_), alpha=False)
@@ -848,6 +1033,7 @@ class PdfView(QAbstractScrollArea):
             img = QImage(8, 8, QImage.Format.Format_RGB32)
             img.fill(QColor("white"))
         self.low[i] = img
+        self._note_render(t0)
         while len(self.low) > 160:
             self.low.popitem(last=False)
 
@@ -857,7 +1043,7 @@ class PdfView(QAbstractScrollArea):
         follows when scrolling pauses. The window therefore never freezes on slow (scanned) pages."""
         if self.doc is None or not self.sizes:
             return
-        scrolling = self._fast or (time.monotonic() - self._last_scroll) < 0.12
+        scrolling = self._fast or (time.monotonic() - self._last_scroll) < self._quiet()
         dpr, z = self.devicePixelRatioF(), self.zoom
         vh, vs = self.viewport().height(), self.verticalScrollBar().value()
         vis = self._visible_pages()
@@ -865,7 +1051,7 @@ class PdfView(QAbstractScrollArea):
         cands = list(vis)
         if not scrolling and vis:                         # idle: also prepare the pages around, nearest first
             lo, hi = min(vis), max(vis)
-            for d in range(1, self.render_half() + 1):
+            for d in range(1, self._prefetch_half() + 1):
                 cands += [i for i in (hi + d, lo - d) if 0 <= i < len(self.sizes)]
         for i in cands:
             if self.sizes[i][0] * z * dpr * self.sizes[i][1] * z * dpr > FULL_RENDER_LIMIT:
@@ -893,21 +1079,26 @@ class PdfView(QAbstractScrollArea):
         r = max(0, min(len(self.row_tops) - 1, bisect_right(self.row_tops, y) - 1))
         return next(i for i in self.rows[r] if i >= 0)
 
-    def goto_page(self, i):
+    def goto_page(self, i, smooth=False):
         if not self.row_tops:
             return
         i = max(0, min(len(self.sizes) - 1, i))
-        self.verticalScrollBar().setValue(int(self.row_tops[self.page_row[i]] - MARGIN))
+        y = int(self.row_tops[self.page_row[i]] - MARGIN)
+        if smooth:
+            self._smooth_to(y)
+        else:
+            self._smooth_stop()
+            self.verticalScrollBar().setValue(y)
 
-    def goto_row_offset(self, d):
+    def goto_row_offset(self, d, smooth=False):
         if not self.row_tops:
             return
         r = max(0, min(len(self.rows) - 1, self.page_row[self.current_page()] + d))
-        self.goto_page(next(i for i in self.rows[r] if i >= 0))
+        self.goto_page(next(i for i in self.rows[r] if i >= 0), smooth)
 
     def _scrolled(self):
         self._last_scroll = time.monotonic()
-        self.settle.start()
+        self.settle.start(int(self._quiet() * 1000) + 20)
         self.viewport().update()
         self.changed.emit()
 
@@ -931,6 +1122,8 @@ class PdfView(QAbstractScrollArea):
     def invalidate(self, i):
         for k in [k for k in self.cache if k[0] == i]:
             del self.cache[k]
+        self._ft_cache.pop(i, None)
+        self.words_cache.pop(i, None)
         self.low.pop(i, None)                 # the old image stays on screen until the new one is ready
         self.viewport().update()
         self._schedule_render()
@@ -941,7 +1134,7 @@ class PdfView(QAbstractScrollArea):
         w = self.words_cache.get(i)
         if w is None:
             try:
-                w = self.doc[i].get_text("words")
+                w = list(self.doc[i].get_text("words")) + self._tb_words(i)
             except Exception:
                 w = []
             self.words_cache[i] = w
@@ -1076,11 +1269,11 @@ class PdfView(QAbstractScrollArea):
             self.add_note(i, x, y, text)
 
     def textbox_at(self, pos):
-        """Add a text box (default size) where the mouse was (right-click menu)."""
+        """Start a text box where the mouse was (right-click menu)."""
         if self.doc is None or not self.sizes or not self._need_pdf():
             return
         i, x, y = self._locate(pos.x(), pos.y())
-        self._finish_textbox({"page": i, "rect": pymupdf.Rect(x, y, x, y), "p0": (x, y)})
+        self.begin_tb_edit(i, None, x, y)
 
     def annot_under(self, pos):
         """Smallest annotation under viewport point `pos` -> (page, annot) or (None, None)."""
@@ -1234,8 +1427,6 @@ class PdfView(QAbstractScrollArea):
         if d["kind"] == "new":
             r = d["rect"]
             self.rect_sel = {"page": d["page"], "rect": r} if (r.width >= 6 and r.height >= 6) else None
-        elif d["kind"] == "newtext":
-            self._finish_textbox(d)
 
     def apply_rect_highlight(self):
         """Turn the adjustable rectangle into a highlight annotation."""
@@ -1262,81 +1453,29 @@ class PdfView(QAbstractScrollArea):
         self.viewport().update()
 
     # ------------------------------------------------------------- text boxes
-    @staticmethod
-    def _tb_default_model(defaults):
-        c = tuple(defaults.get("text", TB_BLACK))
-        return {"size": int(defaults.get("size", 100)), "bg": defaults.get("bg", TB_WHITE),
-                "runs": [{"t": "", "b": 0, "i": 0, "u": 0, "s": 0, "v": 0, "c": c}]}
+    # ================================================================ text boxes
+    # A text box is a standard PDF FreeText annotation: one colour, one size, no background, so
+    # every PDF reader understands it. Latin text is real PDF text; other scripts (Bengali ...) are
+    # drawn by Qt and stored as a CMYK picture. Corner drag = the whole box and its text grow or
+    # shrink together (never stretched); the size slider does the same.
+    TB_MIN_FS, TB_MAX_FS = 5.0, 144.0
 
-    def _tb_model_of(self, annot):
-        """The editable description of an existing text box (formatting is kept in the annotation)."""
-        info = annot.info
-        subj = info.get("subject", "") or ""
+    @staticmethod
+    def _tb_meta(annot):
+        """(font size, CMYK colour) of a text box (also of boxes made by older versions)."""
+        subj = annot.info.get("subject", "") or ""
+        fs, c = 12.0, TB_BLACK
         if subj.startswith("SuReader-tb:"):
             try:
                 m = json.loads(subj[len("SuReader-tb:"):])
-                if isinstance(m, dict) and m.get("runs"):
-                    m["bg"] = tuple(m["bg"]) if m.get("bg") else None
-                    for r in m["runs"]:
-                        r["c"] = tuple(r["c"])
-                    m["size"] = int(m.get("size", 100))
-                    return m
+                if "fs" in m:
+                    fs, c = float(m["fs"]), tuple(int(v) for v in m.get("c", c))
+                elif m.get("runs"):
+                    fs = TB_BASE_PT * int(m.get("size", 100)) / 100.0
+                    c = tuple(int(v) for v in m["runs"][0].get("c", c))
             except Exception:
                 pass
-        m = self._tb_default_model({"size": 100, "bg": None})        # boxes made by older versions
-        m["runs"][0]["t"] = info.get("content", "") or ""
-        return m
-
-    def _create_textbox(self, page, rect, model):
-        """Create the annotation (call inside an op). One plain format + Latin text -> a standard
-        FreeText annotation (real, selectable PDF text). Anything else (mixed formats, underline,
-        super/subscript, Bengali ...) -> drawn by Qt as CMYK layers, with the description kept inside."""
-        text = "".join(r["t"] for r in model["runs"])
-        rect = pymupdf.Rect(rect)
-        bg = model.get("bg")
-        bg_f = pdf_cmyk(bg) if bg else None
-        fs = TB_BASE_PT * model["size"] / 100.0
-        plain = model_plain_format(model)
-        meta = "SuReader-tb:" + json.dumps({"size": model["size"], "bg": list(bg) if bg else None,
-                                            "runs": [dict(r, c=list(r["c"])) for r in model["runs"]]},
-                                           separators=(",", ":"))
-        if plain is not None:
-            bold, italic, col = plain
-            base = {(0, 0): "Helvetica", (1, 0): "Helvetica-Bold", (0, 1): "Helvetica-Oblique",
-                    (1, 1): "Helvetica-BoldOblique"}[(bold, italic)]
-            short = {(0, 0): "helv", (1, 0): "hebo", (0, 1): "heit", (1, 1): "hebi"}[(bold, italic)]
-            width = max(rect.width, 40)
-            lines = self._wrap_latin(text, short, fs, width - 6)
-            leading = fs * 1.2
-            rect.y1 = max(rect.y1, rect.y0 + len(lines) * leading + 6)
-            rect.x1 = max(rect.x1, rect.x0 + 40)
-            a = page.add_freetext_annot(rect, text, fontsize=fs, fontname="helv",
-                                        text_color=pdf_cmyk(col), fill_color=bg_f, align=0)
-            self._set_text_appearance(a, lines, base, fs, leading, col, bg, rect.width, rect.height)
-        else:
-            S = 4                                              # 4x supersampling (288 dpi)
-            wpt = max(rect.width, 40)
-            wpx = int(wpt * S)
-            hpt = max(rect.height, math.ceil(doc_from_model(model, S, wpx).size().height()) / S + 2)
-            hpx = int(hpt * S)
-            layers = []
-            for c in sorted({tuple(r["c"]) for r in model["runs"] if r["t"].strip()}):
-                img = QImage(wpx, hpx, QImage.Format.Format_ARGB32)
-                img.fill(0)
-                pnt = QPainter(img)
-                pnt.setRenderHint(QPainter.RenderHint.Antialiasing)
-                pnt.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-                doc_from_model(model, S, wpx, only=c).drawContents(pnt, QRectF(0, 0, wpx, hpx))
-                pnt.end()
-                ptr = img.constBits()
-                ptr.setsize(img.sizeInBytes() if hasattr(img, "sizeInBytes") else img.byteCount())
-                layers.append((c, bytes(ptr)[3::4]))
-            rect = pymupdf.Rect(rect.x0, rect.y0, rect.x0 + wpt, rect.y0 + hpt)
-            a = page.add_freetext_annot(rect, " ", fontsize=12, fontname="helv", text_color=(0, 0, 0, 1),
-                                        fill_color=bg_f, align=0)
-            self._set_layered_appearance(a, layers, bg, wpx, hpx, rect.width, rect.height)
-        a.set_info(content=text, subject=meta)
-        return a
+        return fs, c
 
     @staticmethod
     def _wrap_latin(text, short, fs, width):
@@ -1359,112 +1498,683 @@ class PdfView(QAbstractScrollArea):
             lines.append(cur)
         return lines
 
-    def _set_text_appearance(self, annot, lines, basefont, fs, leading, col, bg, w_pt, h_pt):
-        """Appearance stream with REAL text in the chosen Helvetica variant and exact CMYK inks."""
-        doc = self.doc
+    def _new_objects(self):
+        """PyMuPDF 1.24's journalling check raises while an operation is open although creating
+        objects inside the operation is exactly what we want (one undo step) -> skip that check."""
         orig = getattr(pymupdf, "JM_have_operation", None)
         if orig is not None:
             pymupdf.JM_have_operation = lambda pdf: 1
+        return orig
+
+    def _set_text_appearance(self, annot, lines, basefont, fs, leading, col, w_pt, h_pt):
+        """Appearance stream with REAL text (Helvetica) in exact CMYK inks."""
+        doc = self.doc
+        orig = self._new_objects()
         try:
             xfont = doc.get_new_xref()
             doc.update_object(xfont, "<</Type/Font/Subtype/Type1/BaseFont/%s/Encoding/WinAnsiEncoding>>" % basefont)
-            ops = []
-            if bg:
-                ops.append("%g %g %g %g k\n0 0 %g %g re f\n" % (tuple(v / 100.0 for v in bg) + (w_pt, h_pt)))
-            ops.append("BT\n%g %g %g %g k\n/F1 %g Tf\n%g TL\n3 %g Td\n"
-                       % (tuple(v / 100.0 for v in col) + (fs, leading, h_pt - 3 - fs * 0.8)))
+            head = "BT\n%g %g %g %g k\n/F1 %g Tf\n%g TL\n3 %g Td\n" % (
+                tuple(v / 100.0 for v in col) + (fs, leading, h_pt - 3 - fs * 0.99))
             body = b"".join(b"(" + ln.encode("latin-1", "replace").replace(b"\\", b"\\\\").replace(b"(", b"\\(")
                             .replace(b")", b"\\)") + b") Tj T*\n" for ln in lines)
             xf = doc.get_new_xref()
             doc.update_object(xf, "<</Type/XObject/Subtype/Form/BBox[0 0 %g %g]/Resources<</Font<</F1 %d 0 R>>>>>>"
                                   % (w_pt, h_pt, xfont))
-            doc.update_stream(xf, "".join(ops).encode() + body + b"ET\n")
+            doc.update_stream(xf, head.encode() + body + b"ET\n")
             doc.xref_set_key(annot.xref, "AP", "<</N %d 0 R>>" % xf)
         finally:
             if orig is not None:
                 pymupdf.JM_have_operation = orig
 
-    def _set_layered_appearance(self, annot, layers, bg, wpx, hpx, w_pt, h_pt):
-        """Appearance stream: the background as a CMYK rectangle, then every text colour as a solid
-        CMYK image shown through its own soft mask - exact inks, smooth edges, transparent between."""
+    def _set_layered_appearance(self, annot, alpha, col, wpx, hpx, w_pt, h_pt):
+        """Appearance stream for non-Latin text: a solid CMYK colour shown through a soft mask
+        (the text as drawn by Qt): exact inks, smooth edges, transparent between the letters."""
         doc = self.doc
-        # PyMuPDF 1.24's journalling check raises while an operation is open, although creating
-        # objects inside the operation is exactly what we want (one undo step) -> skip that check
-        orig = getattr(pymupdf, "JM_have_operation", None)
-        if orig is not None:
-            pymupdf.JM_have_operation = lambda pdf: 1
+        orig = self._new_objects()
         try:
-            ops, xobj = [], []
-            if bg:
-                ops.append("%g %g %g %g k\n0 0 %g %g re f\n" % (tuple(v / 100.0 for v in bg) + (w_pt, h_pt)))
-            for n, (c, alpha) in enumerate(layers):
-                xs = doc.get_new_xref()
-                doc.update_object(xs, "<</Type/XObject/Subtype/Image/Width %d/Height %d/ColorSpace/DeviceGray"
-                                      "/BitsPerComponent 8>>" % (wpx, hpx))
-                doc.update_stream(xs, alpha, compress=True)
-                xi = doc.get_new_xref()
-                doc.update_object(xi, "<</Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceCMYK"
-                                      "/BitsPerComponent 8/SMask %d 0 R>>" % xs)
-                doc.update_stream(xi, bytes(int(round(v * 255 / 100.0)) for v in c))
-                ops.append("q %g 0 0 %g 0 0 cm /Im%d Do Q\n" % (w_pt, h_pt, n))
-                xobj.append("/Im%d %d 0 R" % (n, xi))
+            xs = doc.get_new_xref()
+            doc.update_object(xs, "<</Type/XObject/Subtype/Image/Width %d/Height %d/ColorSpace/DeviceGray"
+                                  "/BitsPerComponent 8>>" % (wpx, hpx))
+            doc.update_stream(xs, alpha, compress=True)
+            xi = doc.get_new_xref()
+            doc.update_object(xi, "<</Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceCMYK"
+                                  "/BitsPerComponent 8/SMask %d 0 R>>" % xs)
+            doc.update_stream(xi, bytes(int(round(v * 255 / 100.0)) for v in col))
             xf = doc.get_new_xref()
-            doc.update_object(xf, "<</Type/XObject/Subtype/Form/BBox[0 0 %g %g]/Resources<</XObject<<%s>>>>>>"
-                                  % (w_pt, h_pt, " ".join(xobj)))
-            doc.update_stream(xf, "".join(ops).encode())
+            doc.update_object(xf, "<</Type/XObject/Subtype/Form/BBox[0 0 %g %g]/Resources<</XObject<</Im0 %d 0 R>>>>>>"
+                                  % (w_pt, h_pt, xi))
+            doc.update_stream(xf, ("q %g 0 0 %g 0 0 cm /Im0 Do Q\n" % (w_pt, h_pt)).encode())
             doc.xref_set_key(annot.xref, "AP", "<</N %d 0 R>>" % xf)
         finally:
             if orig is not None:
                 pymupdf.JM_have_operation = orig
 
-    def add_textbox(self, i, rect, model):
+    @staticmethod
+    def _tb_font():
+        f = QFont("Helvetica")
+        if hasattr(f, "setFamilies"):                      # letters Helvetica lacks (Bengali ...) use the system font
+            f.setFamilies(["Helvetica", QApplication.font().family()])
+        return f
+
+    def _render_text_layer(self, text, fs):
+        """Non-Latin text as an 8-bit mask (4x supersampled), no wrapping, lines 1.2 x the size
+        -> (alpha bytes, wpx, hpx, w_pt, h_pt)."""
+        S = 4
+        font = self._tb_font()
+        font.setPixelSize(max(4, int(round(fs * S))))
+        doc = QTextDocument()
+        doc.setDefaultFont(font)
+        doc.setDocumentMargin(3 * S)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(0, 0, 0))
+        cur = QTextCursor(doc)
+        cur.insertText(text, fmt)
+        bf = QTextBlockFormat()
+        bf.setLineHeight(fs * 1.2 * S, _FHV)
+        cur.select(QTextCursor.SelectionType.Document)
+        cur.mergeBlockFormat(bf)
+        doc.setTextWidth(-1)
+        wpx = int(math.ceil(doc.idealWidth())) + S
+        hpx = int(math.ceil(doc.size().height()))
+        img = QImage(wpx, hpx, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        pnt = QPainter(img)
+        pnt.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pnt.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        doc.drawContents(pnt, QRectF(0, 0, wpx, hpx))
+        pnt.end()
+        ptr = img.constBits()
+        ptr.setsize(img.bytesPerLine() * img.height())
+        raw = bytes(ptr)
+        if img.bytesPerLine() != img.width() * 4:
+            bpl = img.bytesPerLine()
+            raw = b"".join(raw[r * bpl:r * bpl + img.width() * 4] for r in range(img.height()))
+        return raw[3::4], wpx, hpx, wpx / float(S), hpx / float(S)
+
+    def _make_textbox(self, page, x, y, text, fs, c):
+        """Create the annotation (call inside an op) and return it. The box is exactly as big as
+        its text: a long line without Enter = a long box, every Enter = one more line."""
+        W, H = self.sizes[page.number]
+        fs = max(self.TB_MIN_FS, min(self.TB_MAX_FS, float(fs)))
+        c = tuple(int(v) for v in c)
+        meta = "SuReader-tb:" + json.dumps({"v": 3, "fs": round(fs, 2), "c": list(c)}, separators=(",", ":"))
+        rgb = cmyk_rgb(c)
+        try:
+            text.encode("latin-1")
+            latin = True
+        except UnicodeEncodeError:
+            latin = False
+        leading = fs * 1.2
+        if latin:
+            lines = text.split("\n")
+            width = max(pymupdf.get_text_length(ln or " ", fontname="helv", fontsize=fs) for ln in lines) + 7.0
+            h = len(lines) * leading + 6
+        else:
+            alpha, wpx, hpx, width, h = self._render_text_layer(text, fs)
+        width = max(8.0, width)
+        if width <= W:                                     # keep the box on the page
+            x = max(0.0, min(x, W - width))
+        if h <= H:
+            y = max(0.0, min(y, H - h))
+        rect = pymupdf.Rect(x, y, x + width, y + h)
+        a = page.add_freetext_annot(rect, text if latin else " ", fontsize=fs, fontname="helv",
+                                    text_color=rgb, fill_color=None, align=0)
+        if latin:
+            self._set_text_appearance(a, lines, "Helvetica", fs, leading, c, rect.width, rect.height)
+        else:
+            self._set_layered_appearance(a, alpha, c, wpx, hpx, rect.width, rect.height)
+        a.set_info(content=text, subject=meta)
+        return a
+
+    def add_textbox_at(self, i, x, y, text, fs, c):
         if not self._need_pdf():
-            return False
-        W, H = self.sizes[i]
-        rect = pymupdf.Rect(rect)
-        rect.x1, rect.y1 = min(rect.x1, W), min(rect.y1, H)
+            return None
         with self.op("Text box"):
-            page = self.doc[i]
-            self._create_textbox(page, rect, model)
+            xref = self._make_textbox(self.doc[i], x, y, text, fs, c).xref
         self._touch([i])
+        return xref
+
+    MARKUPS = ("Highlight", "Underline", "StrikeOut", "Squiggly")
+
+    def _tb_marks_in(self, page, r):
+        """Highlights / underlines / strikeouts lying on a text box -> [(type, quads, colours, opacity, xref)]."""
+        out = []
+        for a in page.annots():
+            t = a.type[1]
+            if t not in self.MARKUPS:
+                continue
+            c = pymupdf.Rect(a.rect)
+            cx, cy = (c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2
+            if r.x0 - 1 <= cx <= r.x1 + 1 and r.y0 - 1 <= cy <= r.y1 + 1:
+                v = list(a.vertices or [])
+                quads = [pymupdf.Quad(v[k], v[k + 1], v[k + 2], v[k + 3]) for k in range(0, len(v) - 3, 4)]
+                if quads:
+                    out.append((t, quads, a.colors, a.opacity, a.xref))
+        a = None
+        return out
+
+    def _tb_marks_follow(self, page, marks, old, new):
+        """Put those markups on the new place / size of the box (same position inside it)."""
+        sx = new.width / max(1e-6, old.width)
+        sy = new.height / max(1e-6, old.height)
+
+        def mp(p):
+            return pymupdf.Point(new.x0 + (p.x - old.x0) * sx, new.y0 + (p.y - old.y0) * sy)
+        add = {"Highlight": page.add_highlight_annot, "Underline": page.add_underline_annot,
+               "StrikeOut": page.add_strikeout_annot, "Squiggly": page.add_squiggly_annot}
+        for t, quads, colors, opacity, xr in marks:
+            page.delete_annot(page.load_annot(xr))
+            q = [pymupdf.Quad(mp(x.ul), mp(x.ur), mp(x.ll), mp(x.lr)) for x in quads]
+            a = add[t](quads=q)
+            if a is None:
+                continue
+            a.set_colors(stroke=colors.get("stroke"))
+            if opacity is not None and opacity < 1:
+                a.set_opacity(opacity)
+            a.update()
+
+    def rebuild_textbox(self, i, xref, name, text=None, fs=None, c=None, x=None, y=None):
+        """Delete the box and make it again with changed properties (one undo step) -> new xref.
+        Highlights / underlines on its text move (and scale) with it, as long as its text is the same."""
+        page = self.doc[i]
+        old = page.load_annot(xref)
+        r = pymupdf.Rect(old.rect)
+        fs0, c0 = self._tb_meta(old)
+        text0 = old.info.get("content", "") or ""
+        old = None
+        same = text is None or text.rstrip() == text0.rstrip()
+        marks = self._tb_marks_in(page, r) if same else []
+        with self.op(name):
+            page.delete_annot(page.load_annot(xref))
+            a = self._make_textbox(page, r.x0 if x is None else x, r.y0 if y is None else y,
+                                   text0 if text is None else text, fs0 if fs is None else fs,
+                                   c0 if c is None else c)
+            new = a.xref
+            nr = pymupdf.Rect(a.rect)
+            a = None
+            if marks:
+                self._tb_marks_follow(page, marks, r, nr)
+        self._touch([i])
+        return new
+
+    def move_textbox(self, i, xref, dx, dy):
+        page = self.doc[i]
+        W, H = self.sizes[i]
+        with self.op("Move text box"):
+            a = page.load_annot(xref)
+            r = pymupdf.Rect(a.rect)
+            r.x0 += dx
+            r.x1 += dx
+            r.y0 += dy
+            r.y1 += dy
+            a.set_rect(r)
+            del a
+        self._touch([i])
+
+    # ---------------------------------------------------------- selection / geometry
+    def _freetext_rects(self, i):
+        r = self._ft_cache.get(i)
+        if r is None:
+            r = []
+            try:
+                page = self.doc[i]
+                for a in page.annots():
+                    if a.type[1] == "FreeText":
+                        r.append((a.xref, pymupdf.Rect(a.rect)))
+                a = page = None
+            except Exception:
+                pass
+            self._ft_cache[i] = r
+        return r
+
+    def _freetext_at(self, pos):
+        """(page, xref) of the text box under the viewport point, or None."""
+        if self.doc is None or not self.doc.is_pdf or not self.sizes:
+            return None
+        i, x, y = self._locate(pos.x(), pos.y())
+        W, H = self.sizes[i]
+        if not (0 <= x <= W and 0 <= y <= H):
+            return None
+        pt = pymupdf.Point(x, y)
+        best = None
+        for xref, r in self._freetext_rects(i):
+            if pt in pymupdf.Rect(r.x0 - 3, r.y0 - 3, r.x1 + 3, r.y1 + 3):
+                area = r.width * r.height
+                if best is None or area <= best[0]:
+                    best = (area, xref)
+        return (i, best[1]) if best else None
+
+    def _page_to_view(self, i, x, y):
+        px, py = self.page_pos[i]
+        return (self._x_off() + px - self.horizontalScrollBar().value() + x * self.zoom,
+                py - self.verticalScrollBar().value() + y * self.zoom)
+
+    def _view_to_page(self, i, pos):
+        px, py = self.page_pos[i]
+        return ((self.horizontalScrollBar().value() + pos.x() - self._x_off() - px) / self.zoom,
+                (self.verticalScrollBar().value() + pos.y() - py) / self.zoom)
+
+    def _rect_view(self, i, r):
+        x0, y0 = self._page_to_view(i, r.x0, r.y0)
+        return QRectF(x0, y0, r.width * self.zoom, r.height * self.zoom)
+
+    # ------------------------------------------------ text of text boxes = selectable page text
+    def _tb_layout_words(self, text, fs, rect, block):
+        """Word rectangles of one text box (page points), like the words of the page text."""
+        try:
+            text.encode("latin-1")
+            latin = True
+        except UnicodeEncodeError:
+            latin = False
+        S = 4.0
+        if latin:
+            def width(s):
+                return pymupdf.get_text_length(s, fontname="helv", fontsize=fs)
+        else:
+            f = self._tb_font()
+            f.setPixelSize(max(1, int(round(fs * S))))
+            fm = QFontMetricsF(f)
+            adv = getattr(fm, "horizontalAdvance", None) or fm.width
+
+            def width(s):
+                return adv(s) / S
+        lead = fs * 1.2
+        out = []
+        for ln, line in enumerate(text.split("\n")):
+            y0 = rect.y0 + 3 + ln * lead
+            for wn, m in enumerate(re.finditer(r"\S+", line)):
+                x0 = rect.x0 + 3 + width(line[:m.start()])
+                x1 = rect.x0 + 3 + width(line[:m.end()])
+                out.append((x0, y0, x1, y0 + lead, m.group(), block, ln, wn))
+        return out
+
+    def _tb_words(self, i):
+        """Words of the text boxes of page `i`: their text can be selected, copied and marked."""
+        out = []
+        if self.doc is None or not self.doc.is_pdf:
+            return out
+        try:
+            page = self.doc[i]
+            page_words = page.get_text("words")
+            n = 0
+            for a in page.annots():
+                if a.type[1] != "FreeText":
+                    continue
+                text = a.info.get("content", "") or ""
+                if text.strip():
+                    r = pymupdf.Rect(a.rect)
+                    mine = self._tb_layout_words(text, fs=self._tb_meta(a)[0], rect=r, block=10000 + n)
+                    inside = sum(1 for w in page_words
+                                 if r.x0 - 1 <= (w[0] + w[2]) / 2 <= r.x1 + 1 and r.y0 - 1 <= (w[1] + w[3]) / 2 <= r.y1 + 1)
+                    if inside < max(1, len(mine) // 2):        # (some PyMuPDF versions list the box text already)
+                        out.extend(mine)
+                n += 1
+            a = page = None
+        except Exception:
+            pass
+        return out
+
+    # ---------------------------------------------------------- geometry of the box being edited
+    TB_GAP = 3                                   # px between the typing box and its frame
+
+    def _tb_inner_rect(self):
+        st = self._tb_edit
+        x, y = self._page_to_view(st["page"], st["x"], st["y"])
+        return QRectF(x, y, st["w"] * self.zoom, st["h"] * self.zoom)
+
+    def _tb_frame_rect(self):
+        g = self.TB_GAP
+        return self._tb_inner_rect().adjusted(-g, -g, g, g)
+
+    @staticmethod
+    def _tb_grip_rect(fr):
+        return QRectF(fr.center().x() - 15, fr.top() - 16, 30, 10)
+
+    def _tb_hit(self, pos):
+        """What is under a viewport point while a box is edited: 'grip' (the hanger), a corner
+        ('nw' 'ne' 'sw' 'se'), 'gap' (between typing box and frame: does nothing) or None."""
+        if self._tb_edit is None:
+            return None
+        fr = self._tb_frame_rect()
+        pt = QPointF(pos.x(), pos.y())
+        if self._tb_grip_rect(fr).adjusted(-3, -3, 3, 3).contains(pt):
+            return "grip"
+        for name, c in (("nw", fr.topLeft()), ("ne", fr.topRight()),
+                        ("sw", fr.bottomLeft()), ("se", fr.bottomRight())):
+            if abs(pt.x() - c.x()) <= 8 and abs(pt.y() - c.y()) <= 8:
+                return name
+        if fr.adjusted(-2, -2, 2, 2).contains(pt):
+            return "gap"
+        return None
+
+    # ---------------------------------------------------------- mouse: only while a box is edited
+    def _tb_press(self, pos):
+        """Left press while a box is being edited. True = the press belonged to its frame."""
+        hit = self._tb_hit(pos)
+        if hit is None:
+            return False
+        if self._tb_editor is not None:
+            self._tb_editor.hold = True                  # keep typing after this click
+        st = self._tb_edit
+        if hit == "grip":
+            self._tb_drag = {"mode": "move", "start": pos, "x0": st["x"], "y0": st["y"]}
+        elif hit != "gap":
+            self._tb_drag = {"mode": "scale", "corner": hit, "x0": st["x"], "y0": st["y"],
+                             "w0": st["w"], "h0": st["h"], "fs0": st["fs"]}
         return True
 
-    def _tb_edit_dialog(self, model, is_new=False):
-        dlg = TextBoxDialog(self, model)
-        if run_exec(dlg) != QDialog.DialogCode.Accepted:
-            return None
-        m = dlg.result_model()
-        if is_new and self.on_tb_defaults is not None:       # only a NEW box changes what the next one starts with
-            self.on_tb_defaults(dlg.text_color, m["bg"], m["size"])
-        return m
-
-    def _finish_textbox(self, d):
-        i, r = d["page"], d["rect"]
+    def _tb_drag_move(self, pos):
+        d, st = self._tb_drag, self._tb_edit
+        if d is None or st is None:
+            return
+        i = st["page"]
         W, H = self.sizes[i]
-        if r.width < 12 or r.height < 12:                   # a plain click: default size
-            x, y = d["p0"]
-            r = pymupdf.Rect(x, y, min(x + 220, W), min(y + 50, H))
-        m = self._tb_edit_dialog(self._tb_default_model(self.tb_defaults), is_new=True)
-        if m is not None and "".join(x["t"] for x in m["runs"]).strip():
-            self.add_textbox(i, r, m)
+        z = self.zoom
+        if d["mode"] == "move":
+            x = d["x0"] + (pos.x() - d["start"].x()) / z
+            y = d["y0"] + (pos.y() - d["start"].y()) / z
+            st["x"] = max(0.0, min(x, max(0.0, W - st["w"])))
+            st["y"] = max(0.0, min(y, max(0.0, H - st["h"])))
+        else:                                              # same shape: the box and its letters grow together
+            corner = d["corner"]
+            x0, y0, w0, h0 = d["x0"], d["y0"], d["w0"], d["h0"]
+            ax = x0 + w0 if "w" in corner else x0          # the opposite corner stays where it is
+            ay = y0 + h0 if "n" in corner else y0
+            cx = x0 if "w" in corner else x0 + w0
+            cy = y0 if "n" in corner else y0 + h0
+            mx, my = self._view_to_page(i, pos)
+            vx, vy = cx - ax, cy - ay
+            s = ((mx - ax) * vx + (my - ay) * vy) / max(1e-6, vx * vx + vy * vy)
+            lo, hi = self.TB_MIN_FS / d["fs0"], self.TB_MAX_FS / d["fs0"]
+            st["fs"] = d["fs0"] * max(lo, min(hi, s))
+            self._place_tb_ui()                            # the new size of the text -> st["w"], st["h"]
+            st["x"] = ax - st["w"] if "w" in corner else ax
+            st["y"] = ay - st["h"] if "n" in corner else ay
+        self._place_tb_ui()
+        self.viewport().update()
+
+    def _tb_drag_end(self):
+        self._tb_drag = None
+        if self._tb_editor is not None:
+            self._tb_editor.setFocus()
+        self.viewport().update()
+
+    def _tb_hover(self, pos):
+        """Cursors on the frame of the box being edited. Anywhere else (and for boxes that are not
+        being edited) the cursor is never changed by a text box."""
+        shape = None
+        hit = self._tb_hit(pos) if self._tb_edit is not None else None
+        if hit == "grip":
+            shape = Qt.CursorShape.SizeAllCursor
+        elif hit in ("nw", "se"):
+            shape = Qt.CursorShape.SizeFDiagCursor
+        elif hit in ("ne", "sw"):
+            shape = Qt.CursorShape.SizeBDiagCursor
+        elif hit == "gap":
+            shape = Qt.CursorShape.ArrowCursor
+        if shape is not None:
+            self._tb_cur = True
+            self._set_cursor(shape)
+            return True
+        if self._tb_cur:
+            self._tb_cur = False
+            self._over_link = False
+            self._cur_shape = None
+            self.viewport().setCursor(CURSORS.get(self.tool, CURSORS["hand"]))
+        return False
+
+    def _paint_tb(self, p, i, x, y):
+        """The frame, corner handles and hanger of the box being edited."""
+        st = self._tb_edit
+        if st is None or st["page"] != i:
+            return
+        z = self.zoom
+        if self._tb_clean is not None:
+            cz, pm, r = self._tb_clean
+            if abs(cz - z) > 1e-6:
+                self._tb_clean = None
+                self._tb_make_clean(i, r)
+            if self._tb_clean is not None:
+                p.drawPixmap(QPointF(x + r.x0 * z, y + r.y0 * z), self._tb_clean[1])
+        fr = self._tb_frame_rect()
+        g = self._tb_grip_rect(fr)
+        cx = g.center().x()
+        blue = QColor(42, 86, 198)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(blue, 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(fr, 4, 4)
+        p.drawLine(QPointF(cx, g.bottom()), QPointF(cx, fr.top() + self.TB_GAP))     # the hanger holds both boxes
+        p.setBrush(blue)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(g, 4, 4)
+        p.setPen(QPen(QColor(255, 255, 255), 1.2))
+        for k in (-6, 0, 6):
+            p.drawLine(QPointF(cx + k, g.top() + 2.5), QPointF(cx + k, g.bottom() - 2.5))
+        p.setPen(QPen(blue, 1.5))
+        p.setBrush(QColor(255, 255, 255))
+        for c in (fr.topLeft(), fr.topRight(), fr.bottomLeft(), fr.bottomRight()):
+            p.drawRect(QRectF(c.x() - 4.5, c.y() - 4.5, 9, 9))
+        p.restore()
+
+    # ---------------------------------------------------------- the bar above the box + typing on the page
+    def _ensure_pill(self):
+        if self._tb_pill is None:
+            pill = TbPill(self.viewport())
+            pill.color_clicked.connect(self._pill_color)
+            pill.delete_clicked.connect(self._pill_delete)
+            pill.grabbed.connect(self._pill_grabbed)
+            self._tb_pill = pill
+        return self._tb_pill
+
+    def _pill_grabbed(self):
+        if self._tb_editor is not None:
+            self._tb_editor.hold = True                    # (the click took the focus away from the typing box)
+
+    def _tb_fix_lines(self):
+        """Every line of the editor is 1.2 x the text size high (as in the saved box)."""
+        ed, st = self._tb_editor, self._tb_edit
+        if ed is None or st is None:
+            return
+        h = st["fs"] * 1.2 * self.zoom
+        doc = ed.document()
+        todo = []
+        b = doc.begin()
+        while b.isValid():
+            bf = b.blockFormat()
+            if abs(bf.lineHeight() - h) > 0.01 or int(bf.lineHeightType()) != int(_FHV):
+                todo.append(b.position())
+            b = b.next()
+        if not todo:
+            return
+        self._tb_busy = True
+        try:
+            cur = QTextCursor(doc)
+            cur.joinPreviousEditBlock()
+            fmt = QTextBlockFormat()
+            fmt.setLineHeight(h, _FHV)
+            for pos in todo:
+                cur.setPosition(pos)
+                cur.mergeBlockFormat(fmt)
+            cur.endEditBlock()
+        finally:
+            self._tb_busy = False
+
+    def _tb_content_px(self):
+        """Size of the typing box in pixels: exactly the size of its text."""
+        ed, st = self._tb_editor, self._tb_edit
+        d = ed.document()
+        z = self.zoom
+        d.setTextWidth(-1)
+        w = int(math.ceil(d.idealWidth())) + 2
+        h = int(math.ceil(d.size().height()))
+        return max(w, int(round((8 + st["fs"] * 0.5) * z))), max(h, 4)
+
+    def _tb_text_changed(self):
+        if self._tb_busy:
+            return
+        self._tb_fix_lines()
+        self._place_tb_ui()
+        self.viewport().update()
+
+    def _place_tb_ui(self):
+        if self.doc is None:
+            return
+        ed, st = self._tb_editor, self._tb_edit
+        pill = self._tb_pill
+        if ed is None or not st:
+            if pill is not None and pill.isVisible():
+                pill.hide()
+            return
+        z = self.zoom
+        key = (max(4, int(round(st["fs"] * z))), round(z, 4), round(st["fs"], 3))
+        if st.get("_key") != key:                       # size of the letters follows the zoom / the box size
+            st["_key"] = key
+            f = ed.font()
+            f.setPixelSize(key[0])
+            ed.setFont(f)
+            ed.document().setDocumentMargin(3 * z)
+            self._tb_fix_lines()
+        wpx, hpx = self._tb_content_px()
+        st["w"], st["h"] = wpx / z, hpx / z
+        x, y = self._page_to_view(st["page"], st["x"], st["y"])
+        geo = (int(round(x)), int(round(y)), wpx, hpx)
+        g = ed.geometry()
+        if (g.x(), g.y(), g.width(), g.height()) != geo:
+            ed.setGeometry(*geo)
+            ed.horizontalScrollBar().setValue(0)
+            ed.verticalScrollBar().setValue(0)
+            self.viewport().update()
+        pill = self._ensure_pill()
+        pill.set_values(st["c"])
+        pill.set_dark(self.dark)
+        sz = pill.sizeHint()
+        fr = self._tb_frame_rect()
+        py = self._tb_grip_rect(fr).top() - sz.height() - 4
+        if py < 2:
+            py = fr.bottom() + 8
+        px = max(2, min(fr.left(), self.viewport().width() - sz.width() - 2))
+        g = pill.geometry()
+        if (g.x(), g.y(), g.width(), g.height()) != (int(px), int(py), sz.width(), sz.height()):
+            pill.setGeometry(int(px), int(py), sz.width(), sz.height())
+        if not pill.isVisible():
+            pill.show()
+        pill.raise_()
+
+    def _tb_make_clean(self, i, rect):
+        """The page without annotations under the box (so the old text does not show through the editor)."""
+        try:
+            pix = self.doc[i].get_pixmap(matrix=pymupdf.Matrix(self.zoom, self.zoom), clip=rect, alpha=False,
+                                         annots=False)
+            self._tb_clean = (self.zoom, QPixmap.fromImage(self._qimage(pix).copy()), pymupdf.Rect(rect))
+        except Exception:
+            self._tb_clean = None
+
+    def _tb_set_color(self, c):
+        rgb = cmyk_rgb(c)
+        self._tb_editor.setStyleSheet(
+            "QTextEdit { background: transparent; border: none; padding: 0px; color: rgb(%d,%d,%d); }"
+            % tuple(int(v * 255) for v in rgb))
+
+    def begin_tb_edit(self, i, xref=None, x=0.0, y=0.0):
+        """Type in a text box on the page: a new one (xref None) or an existing one (double click)."""
+        if self.doc is None or not self._need_pdf():
+            return
+        self._tb_end_edit(True)
+        fs, c, text = self.tb_defaults["fs"], tuple(self.tb_defaults["c"]), ""
+        if xref is not None:
+            page = self.doc[i]
+            a = page.load_annot(xref)
+            if a is None:
+                return
+            r = pymupdf.Rect(a.rect)
+            fs, c = self._tb_meta(a)
+            text = a.info.get("content", "") or ""
+            x, y = r.x0, r.y0
+            a = page = None
+            self._tb_make_clean(i, r)
+        self._tb_edit = {"page": i, "xref": xref, "x": x, "y": y, "w": 24.0, "h": fs * 1.2 + 6, "fs": fs, "c": c,
+                         "orig": (text.rstrip(), fs, tuple(c), x, y)}
+        ed = TbEditor(self.viewport())
+        ed.setFont(self._tb_font())
+        ed.setPlainText(text)
+        self._tb_editor = ed
+        self._tb_set_color(c)
+        ed.finished.connect(lambda: self._tb_end_edit(True))
+        self._place_tb_ui()
+        ed.textChanged.connect(self._tb_text_changed)
+        ed.show()
+        ed.setFocus()
+        ed.moveCursor(QTextCursor.MoveOperation.End)
+        self.viewport().update()
+
+    def _tb_end_edit(self, commit=True):
+        ed, st = self._tb_editor, self._tb_edit
+        if ed is None or st is None:
+            return
+        text = ed.toPlainText().rstrip()
+        self._tb_editor = self._tb_edit = None
+        self._tb_clean = None
+        self._tb_drag = None
+        ed._closing = True
+        ed.hide()
+        ed.deleteLater()
+        i, xref = st["page"], st["xref"]
+        if commit:
+            if text.strip():
+                if xref is None:
+                    self.add_textbox_at(i, st["x"], st["y"], text, st["fs"], st["c"])
+                    if self.on_tb_defaults is not None:
+                        self.on_tb_defaults(st["c"], st["fs"])
+                elif (text, st["fs"], tuple(st["c"]), st["x"], st["y"]) != st["orig"]:
+                    self.rebuild_textbox(i, xref, "Edit text box", text=text, fs=st["fs"], c=st["c"],
+                                         x=st["x"], y=st["y"])
+                    if self.on_tb_defaults is not None:
+                        self.on_tb_defaults(st["c"], st["fs"])
+            elif xref is not None:                         # all text deleted: the box goes (as in Firefox)
+                self.delete_annot_xref(i, xref)
+        self._place_tb_ui()
+        self.viewport().update()
+        self.setFocus()
+
+    def _pill_color(self):
+        st, ed = self._tb_edit, self._tb_editor
+        if st is None or ed is None:
+            return
+        ed.busy = True                                     # the colour window must not end the typing
+        try:
+            dlg = CmykPicker(self, st["c"], title="Text colour")
+            ok = run_exec(dlg) == QDialog.DialogCode.Accepted and dlg.value is not None
+        finally:
+            ed.busy = False
+        if ok and self._tb_edit is st:
+            c = tuple(dlg.value)
+            st["c"] = c
+            self._tb_set_color(c)
+            if self.on_tb_defaults is not None:
+                self.on_tb_defaults(c, st["fs"])
+            self._place_tb_ui()
+        if self._tb_editor is ed:
+            ed.setFocus()
+        self.viewport().update()
+
+    def _pill_delete(self):
+        st = self._tb_edit
+        if st is None:
+            return
+        self._tb_end_edit(False)
+        if st["xref"] is not None:
+            self.delete_annot_xref(st["page"], st["xref"])
+        self._place_tb_ui()
         self.viewport().update()
 
     def edit_textbox(self, page, annot):
-        old = self._tb_model_of(annot)
-        m = self._tb_edit_dialog(old)
-        if m is None or not "".join(x["t"] for x in m["runs"]).strip() or m == old:
-            return
-        rect, i = pymupdf.Rect(annot.rect), page.number
-        with self.op("Edit text box"):
-            page.delete_annot(annot)
-            self._create_textbox(page, rect, m)
-        self._touch([i])
+        self.begin_tb_edit(page.number, annot.xref)
 
     def edit_textbox_xref(self, i, xref):
-        page = self.doc[i]
-        a = page.load_annot(xref)
-        if a is not None:
-            self.edit_textbox(page, a)
+        self.begin_tb_edit(i, xref)
+
 
     # ------------------------------------- remove (part of) a markup annotation
     @staticmethod
@@ -1577,8 +2287,6 @@ class PdfView(QAbstractScrollArea):
         page, a = self.annot_under(pos)
         if a is not None and a.type[1] == "Text":
             self.edit_note(a)
-        elif a is not None and a.type[1] == "FreeText":
-            self.edit_textbox(page, a)
 
     # ---------------------------------------------------------------- links
     def links(self, i):
@@ -1629,6 +2337,8 @@ class PdfView(QAbstractScrollArea):
         self._set_cursor(Qt.CursorShape.IBeamCursor if mode == "text" else Qt.CursorShape.CrossCursor)
 
     def _hover(self, pos):
+        if self._tb_edit is not None and self._tb_hover(pos):
+            return
         if self.doc is not None and self.sizes and self.tool == "highlight":
             self._hover_highlight(pos)
             return
@@ -1796,7 +2506,7 @@ class PdfView(QAbstractScrollArea):
                 p.setPen(QColor(150, 150, 150))
                 p.drawText(QRectF(x, y, w, h), int(Qt.AlignmentFlag.AlignCenter), str(i + 1))
         else:
-            if self._fast or (time.monotonic() - self._last_scroll) < 0.12:
+            if self._fast or (time.monotonic() - self._last_scroll) < self._quiet():
                 return                      # huge zoom: draw while scrolling pauses (settle repaints)
             vw, vh = self.viewport().width(), self.viewport().height()
             l, t = max(0.0, -x) / z, max(0.0, -y) / z
@@ -1873,8 +2583,10 @@ class PdfView(QAbstractScrollArea):
                 x, y = xo + px - hs, py - vs
                 self._paint_page(p, i, x, y, self.sizes[i][0] * z, self.sizes[i][1] * z)
                 self._paint_overlays(p, i, x, y)
+                self._paint_tb(p, i, x, y)
+        self._place_tb_ui()
         if self._need:
-            self._schedule_render(30 if (time.monotonic() - self._last_scroll) < 0.12 else 0)
+            self._schedule_render(30 if (time.monotonic() - self._last_scroll) < self._quiet() else 0)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -1905,27 +2617,117 @@ class PdfView(QAbstractScrollArea):
             hs.setValue(hs.value() - delta // 2)
             ev.accept()
             return
+        if (self.smooth_scroll and self.doc is not None and ev.pixelDelta().isNull()
+                and delta and not ev.angleDelta().x()):
+            self._smooth_wheel(delta)                  # (a touchpad already scrolls smoothly by itself)
+            ev.accept()
+            return
         super().wheelEvent(ev)
+
+    def _arrow_scroll(self, sign):
+        step = self.sm["sm_arrow_lines"] / 10.0 * self._line_px()
+        self._smooth_by(sign * step, self.sm["sm_arrow_ms"], step + self.sm["sm_arrow_run"])
+
+    def _smooth_stop(self):
+        self._sm_timer.stop()
+        self._sm_target = None
+        self._sm_last = None
+
+    def _gliding(self):
+        return self._sm_target is not None and self.verticalScrollBar().value() == self._sm_last
+
+    SMOOTH_MS = 445          # how long one glide takes (milliseconds)
+
+    def _line_px(self):
+        """Height of one line of ordinary page text on the screen (about 14.5 pt at this zoom)."""
+        return max(14.0, min(40.0, 14.5 * self.zoom))
+
+    def _smooth_start(self):
+        if not self._sm_timer.isActive():
+            self._sm_timer.start()
+
+    def _smooth_set(self, target, ms=None, cap=None):
+        sb = self.verticalScrollBar()
+        if cap is not None:                          # never stay ahead of the screen by more than `cap` px
+            target = max(sb.value() - cap, min(sb.value() + cap, target))
+        self._sm_dur = float(ms or self.SMOOTH_MS)
+        self._sm_last = sb.value()
+        self._sm_from = float(sb.value())            # (a new notch while gliding starts from where it is now)
+        self._sm_t0 = time.monotonic()
+        self._sm_prev = None
+        self._sm_target = max(float(sb.minimum()), min(float(sb.maximum()), float(target)))
+        self._smooth_start()
+
+    def _smooth_by(self, px, ms=None, cap=None):
+        """Scroll down by `px` (up when negative): glides, and adds to a glide already going on."""
+        sb = self.verticalScrollBar()
+        if not self.smooth_scroll:
+            sb.setValue(sb.value() + int(px))
+            return
+        self._smooth_set((self._sm_target if self._gliding() else sb.value()) + px, ms, cap)
+
+    def _smooth_to(self, y):
+        """Scroll to position `y`: glides when it is near, jumps when it is far away (no flying through a book)."""
+        sb = self.verticalScrollBar()
+        if not self.smooth_scroll or abs(y - sb.value()) > self.sm["sm_jump_screens"] * self.viewport().height():
+            self._smooth_stop()
+            sb.setValue(int(y))
+            return
+        self._smooth_set(y, self.sm["sm_page_ms"])
+
+    def _smooth_wheel(self, delta):
+        sb = self.verticalScrollBar()
+        notch = self.sm["sm_wheel_lines"] / 10.0 * self._line_px()
+        if self._fast:                                # just zoomed: scroll plainly until the page has settled
+            self._smooth_stop()
+            sb.setValue(sb.value() - int(delta / 120.0 * notch))
+            return
+        self._smooth_by(-delta / 120.0 * notch, self.sm["sm_wheel_ms"])
+
+    def _smooth_step(self):
+        sb = self.verticalScrollBar()
+        if self._sm_target is None or sb.value() != self._sm_last:   # something else scrolled: let go
+            self._smooth_stop()
+            return
+        now = time.monotonic()
+        late = self._sm_prev is not None and now - self._sm_prev > 0.12
+        self._sm_prev = now
+        p = 1.0 if late else (now - self._sm_t0) * 1000.0 / self._sm_dur
+        if p >= 1.0:
+            sb.setValue(int(round(self._sm_target)))
+            self._smooth_stop()
+            return
+        e = 1.0 - (1.0 - p) ** 3                      # fast start, soft landing
+        sb.setValue(int(round(self._sm_from + (self._sm_target - self._sm_from) * e)))
+        self._sm_last = sb.value()
+        self._smooth_start()
 
     def mousePressEvent(self, ev):
         self.setFocus()
         if ev.button() == Qt.MouseButton.RightButton:
             self._right_zoomed = False
+            if self.doc is not None and self.sizes:
+                self._rpan = self._rstart = ev_pos(ev)
+                self._rmoved = False
             return
         if ev.button() != Qt.MouseButton.LeftButton or self.doc is None or not self.sizes:
             return
         pos = ev_pos(ev)
         self._press, self._moved = pos, False
         t = self.tool
+        if self._tb_edit is not None:
+            if self._tb_press(pos):                   # the frame / hanger of the box being typed
+                self._press = None
+                return
+            self._tb_end_edit(True)                   # a click anywhere else ends typing
         if t == "hand":
             self._pan = pos
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
         elif t == "highlight":
             self._press_highlight(pos, ev.modifiers())
         elif t == "textbox":
-            i, x, y = self._locate(pos.x(), pos.y())
-            self._rect_drag = {"kind": "newtext", "page": i, "p0": (x, y), "rect": pymupdf.Rect(x, y, x, y)}
-            self.viewport().update()
+            if self._freetext_at(pos) is None:        # (an existing box needs a double click)
+                self._tb_new = self._locate(pos.x(), pos.y())   # only the cursor shows where it will start
         elif t == "select" or t in MARKUP:
             i, x, y = self._locate(pos.x(), pos.y())
             k = self.word_at(i, x, y)
@@ -1948,6 +2750,19 @@ class PdfView(QAbstractScrollArea):
 
     def mouseMoveEvent(self, ev):
         pos = ev_pos(ev)
+        if self._rpan is not None and (ev.buttons() & Qt.MouseButton.RightButton):
+            if not self._rmoved and (pos - self._rstart).manhattanLength() > 4:
+                self._rmoved = True
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._rmoved:                                   # whatever tool is on: move the page
+                d = pos - self._rpan
+                self._rpan = pos
+                self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+                self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+            return
+        if self._tb_drag is not None and (ev.buttons() & Qt.MouseButton.LeftButton):
+            self._tb_drag_move(pos)
+            return
         if self._press is None:
             self._hover(pos)
             return
@@ -1976,6 +2791,16 @@ class PdfView(QAbstractScrollArea):
     def mouseReleaseEvent(self, ev):
         pos = ev_pos(ev)
         if ev.button() == Qt.MouseButton.LeftButton:
+            if self._tb_drag is not None:
+                self._tb_drag_end()
+                self._press = None
+                return
+            if self._tb_new is not None:
+                i, x, y = self._tb_new
+                self._tb_new = None
+                self._press = None
+                self.begin_tb_edit(i, None, x, y)
+                return
             if self._rect_drag is not None:
                 self._finish_rect_drag()
             elif self._pan is not None:
@@ -1999,34 +2824,51 @@ class PdfView(QAbstractScrollArea):
             self._press = None
             self.viewport().update()
         elif ev.button() == Qt.MouseButton.RightButton:
-            if not self._right_zoomed and self.menu_factory:
+            moved = self._rmoved
+            self._rpan = self._rstart = None
+            self._rmoved = False
+            if moved:
+                self.viewport().setCursor(CURSORS.get(self.tool, CURSORS["hand"]))
+            elif not self._right_zoomed and self.menu_factory:        # a plain click: the menu
                 menu = self.menu_factory(self, pos)
                 run_exec(menu, ev_global(ev))
                 menu.deleteLater()
             self._right_zoomed = False
+
+    def mouseDoubleClickEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self.doc is not None and self.doc.is_pdf and self.sizes:
+            hit = self._freetext_at(ev_pos(ev))
+            if hit:                                   # a double click, in any tool, makes the box editable
+                self._tb_drag = self._tb_new = None
+                self._press = self._pan = None
+                self._selecting = False
+                self.sel = None
+                self.begin_tb_edit(hit[0], hit[1])
+                return
+        super().mouseDoubleClickEvent(ev)
 
     def keyPressEvent(self, ev):
         k, mod = ev.key(), ev.modifiers()
         vs, hs = self.verticalScrollBar(), self.horizontalScrollBar()
         K = Qt.Key
         if k == K.Key_PageDown or (k == K.Key_Space and not mod):
-            vs.setValue(vs.value() + int(self.viewport().height() * 0.9))
+            self._smooth_by(int(self.viewport().height() * self.sm["sm_page_pct"] / 100.0), self.sm["sm_page_ms"])
         elif k == K.Key_PageUp or (k == K.Key_Space and mod & Qt.KeyboardModifier.ShiftModifier):
-            vs.setValue(vs.value() - int(self.viewport().height() * 0.9))
+            self._smooth_by(-int(self.viewport().height() * self.sm["sm_page_pct"] / 100.0), self.sm["sm_page_ms"])
         elif k == K.Key_Down:
-            vs.setValue(vs.value() + 60)
+            self._arrow_scroll(1)
         elif k == K.Key_Up:
-            vs.setValue(vs.value() - 60)
+            self._arrow_scroll(-1)
         elif k in (K.Key_Right, K.Key_Left):
             sign = 1 if k == K.Key_Right else -1
             if hs.maximum() > 0:
                 hs.setValue(hs.value() + 60 * sign)
             else:
-                self.goto_row_offset(sign)
+                self.goto_row_offset(sign, True)
         elif k == K.Key_Home:
-            self.goto_page(0)
+            self.goto_page(0, True)
         elif k == K.Key_End:
-            self.goto_page(self.page_count - 1)
+            self.goto_page(self.page_count - 1, True)
         elif k in (K.Key_Return, K.Key_Enter) and self.rect_sel is not None:
             self.apply_rect_highlight()
         elif k == K.Key_Escape:
@@ -2093,10 +2935,11 @@ class MarkList(QListWidget):
 
 class ThumbView(QAbstractScrollArea):
     """Page thumbnails. Only the visible cells are drawn and thumbnails are rendered one at a time
-    in the background, so even a thousand-page scan neither freezes nor needs seconds to build."""
+    in the background, so even a thousand-page scan neither freezes nor needs seconds to build.
+    Every cell has the shape of its page (slides are wide, A4 is tall), so there are no big gaps."""
     page_clicked = pyqtSignal(int)
-    TW, TH = 120, 160                # start values; they follow the width of the panel (80 - 400 px)
-    CELL_H = TH + 36
+    TW = 120                         # start value; it follows the width of the panel (80 - 400 px)
+    LABEL_H = 34                     # room for the page number under each thumbnail
 
     def __init__(self):
         super().__init__()
@@ -2106,11 +2949,13 @@ class ThumbView(QAbstractScrollArea):
         self._settle.timeout.connect(self._resize_settled)
         self.n = 0
         self.cur = -1
+        self.aspects = []                # height / width of every page
+        self.tops = [0]                  # y of every cell (+ the total height at the end)
         self.pix = OrderedDict()
         self.render_fn = None
         self._last_scroll = 0.0
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.verticalScrollBar().setSingleStep(self.CELL_H // 2)
+        self.verticalScrollBar().setSingleStep(80)
         self.verticalScrollBar().valueChanged.connect(self._scrolled)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -2119,9 +2964,29 @@ class ThumbView(QAbstractScrollArea):
     def count(self):
         return self.n
 
-    def set_count(self, n, render_fn):
+    # -- geometry
+    def _th(self, i):
+        a = self.aspects[i] if i < len(self.aspects) else 4 / 3.0
+        return max(24, int(round(self.TW * a)))
+
+    def _cell(self, i):
+        return self._th(i) + self.LABEL_H
+
+    def _relayout(self):
+        t, tops = 0, [0]
+        for i in range(self.n):
+            t += self._cell(i)
+            tops.append(t)
+        self.tops = tops
+
+    def _index_at(self, y):
+        return max(0, min(self.n - 1, bisect.bisect_right(self.tops, y) - 1)) if self.n else 0
+
+    def set_count(self, n, render_fn, aspects=None):
         self.n, self.render_fn, self.cur = n, render_fn, -1
+        self.aspects = [min(2.5, max(0.4, a)) for a in (aspects or [])]
         self.pix.clear()
+        self._relayout()
         self._update_range()
         self.verticalScrollBar().setValue(0)
         self.viewport().update()
@@ -2130,19 +2995,22 @@ class ThumbView(QAbstractScrollArea):
     def _update_range(self):
         vh = self.viewport().height()
         vs = self.verticalScrollBar()
-        vs.setRange(0, max(0, self.n * self.CELL_H - vh))
+        vs.setRange(0, max(0, self.tops[-1] - vh))
         vs.setPageStep(vh)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         tw = max(80, min(400, (self.viewport().width() - 24) // 4 * 4))
         if tw != self.TW:
-            top_page = self.verticalScrollBar().value() / max(1, self.CELL_H)
-            self.TW, self.TH = tw, tw * 4 // 3
-            self.CELL_H = self.TH + 36
-            self.verticalScrollBar().setSingleStep(self.CELL_H // 2)
+            y = self.verticalScrollBar().value()
+            i = self._index_at(y)
+            frac = i + (y - self.tops[i]) / max(1.0, float(self._cell(i))) if self.n else 0   # keep the same page on top
+            self.TW = tw
+            self._relayout()
             self._update_range()
-            self.verticalScrollBar().setValue(int(top_page * self.CELL_H))
+            if self.n:
+                k = min(int(frac), self.n - 1)
+                self.verticalScrollBar().setValue(int(self.tops[k] + (frac - k) * self._cell(k)))
             self._settle.start(300)              # sharp thumbnails once the border stops moving
         self._update_range()
         self.viewport().update()
@@ -2158,8 +3026,12 @@ class ThumbView(QAbstractScrollArea):
         self._sched()
 
     def _visible(self, extra=0):
+        if not self.n:
+            return range(0)
         vs, vh = self.verticalScrollBar().value(), self.viewport().height()
-        return range(max(0, vs // self.CELL_H - extra), min(self.n, (vs + vh) // self.CELL_H + 1 + extra))
+        first = self._index_at(vs)
+        last = self._index_at(vs + vh)
+        return range(max(0, first - extra), min(self.n, last + 1 + extra))
 
     def _scrolled(self, *a):
         self._last_scroll = time.monotonic()
@@ -2177,8 +3049,8 @@ class ThumbView(QAbstractScrollArea):
             self._sched()
             return
         vs, vh = self.verticalScrollBar().value(), self.viewport().height()
-        mid = (vs + vh / 2) / self.CELL_H
-        for i in sorted(self._visible(2), key=lambda k: abs(k + 0.5 - mid)):
+        mid = self._index_at(vs + vh // 2)
+        for i in sorted(self._visible(2), key=lambda k: abs(k - mid)):
             if i in self.pix:
                 continue
             try:
@@ -2203,16 +3075,16 @@ class ThumbView(QAbstractScrollArea):
         if page == self.cur:
             return
         self.cur = page
-        if page >= 0 and page not in self._visible():
+        if 0 <= page < self.n and page not in self._visible():
             vh = self.viewport().height()
-            self.verticalScrollBar().setValue(max(0, page * self.CELL_H - (vh - self.CELL_H) // 2))
+            self.verticalScrollBar().setValue(max(0, self.tops[page] - (vh - self._cell(page)) // 2))
         self.viewport().update()
 
     def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            i = (self.verticalScrollBar().value() + ev_pos(ev).y()) // self.CELL_H
-            if 0 <= i < self.n:
-                self.page_clicked.emit(int(i))
+        if ev.button() == Qt.MouseButton.LeftButton and self.n:
+            y = self.verticalScrollBar().value() + ev_pos(ev).y()
+            if 0 <= y < self.tops[-1]:
+                self.page_clicked.emit(int(self._index_at(y)))
 
     def paintEvent(self, ev):
         p = QPainter(self.viewport())
@@ -2221,11 +3093,12 @@ class ThumbView(QAbstractScrollArea):
         p.fillRect(self.viewport().rect(), base)
         vs, vw = self.verticalScrollBar().value(), self.viewport().width()
         for i in self._visible():
-            top = i * self.CELL_H - vs
+            top = self.tops[i] - vs
+            th = self._th(i)
             if i == self.cur:
                 hl = QColor(pal.color(QPalette.ColorRole.Highlight))
                 hl.setAlpha(90)
-                p.fillRect(QRect(3, top + 2, vw - 6, self.CELL_H - 4), hl)
+                p.fillRect(QRect(3, top + 2, vw - 6, th + self.LABEL_H - 4), hl)
             pm = self.pix.get(i)
             if pm is not None and not pm.isNull():
                 if self.pix_tw != self.TW:               # border is being dragged: scale what we have
@@ -2236,12 +3109,12 @@ class ThumbView(QAbstractScrollArea):
                 else:
                     p.drawPixmap((vw - pm.width()) // 2, top + 4, pm)
             else:
-                box = QRect((vw - self.TW) // 2, top + 4, self.TW, self.TH)
+                box = QRect((vw - self.TW) // 2, top + 4, self.TW, th)
                 p.fillRect(box, QColor(60, 60, 64) if base.lightness() < 100 else QColor(245, 245, 245))
                 p.setPen(QColor(150, 150, 150))
                 p.drawRect(box.adjusted(0, 0, -1, -1))
             p.setPen(pal.color(QPalette.ColorRole.Text))
-            p.drawText(QRect(0, top + 4 + self.TH + 2, vw, 26), int(Qt.AlignmentFlag.AlignCenter), str(i + 1))
+            p.drawText(QRect(0, top + 4 + th + 2, vw, 26), int(Qt.AlignmentFlag.AlignCenter), str(i + 1))
 
 
 class Dock(QDockWidget):
@@ -2330,7 +3203,8 @@ class Sidebar(QObject):
             it.setDisabled(True)
         else:
             self.tree.expandToDepth(0)
-        self.thumbs.set_count(v.page_count, self._thumb_pix)
+        self.thumbs.set_count(v.page_count, self._thumb_pix,
+                              [h / max(1.0, w) for (w, h) in v.sizes])
         self._refresh_marks()
         self.select_page(v.current_page())
 
@@ -2342,9 +3216,10 @@ class Sidebar(QObject):
     def _loaded(self):
         return {k for k, pm in self.thumbs.pix.items() if not pm.isNull()}
 
-    def _thumb_pix(self, i, tw=None):
+    def _thumb_pix(self, i, tw=None, box=False):
         """Thumbnail of page i as a QPixmap with a thin border (None if it cannot be rendered).
-        `tw` = width in px (default: the current width of the Thumbnails panel)."""
+        `tw` = width in px (default: the current width of the Thumbnails panel). The thumbnail fills
+        that width; with box=True it fits inside a tw x (4/3 tw) box instead (bookmark list)."""
         v = self.view
         if v is None or v.doc is None or not (0 <= i < v.page_count):
             return None
@@ -2352,7 +3227,7 @@ class Sidebar(QObject):
         th = tw * 4 // 3
         page = v.doc[i]
         r = page.rect
-        z = min(tw / max(r.width, 1), th / max(r.height, 1))
+        z = min(tw / max(r.width, 1), th / max(r.height, 1)) if box else tw / max(r.width, 1)
         pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
         del page
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
@@ -2456,7 +3331,7 @@ class Sidebar(QObject):
         if it is not None:
             page = it.data(self.UR)
             try:
-                pm = self._thumb_pix(page, self.mark_tw)
+                pm = self._thumb_pix(page, self.mark_tw, box=True)
                 if pm is not None and gen == self._mark_gen:
                     icon = QIcon(pm)
                     self._mark_icons[page] = icon
@@ -2539,6 +3414,7 @@ class RecentStore:
         self.data.setdefault("hide", False)
         self.data.setdefault("docs", {})
         self.data.setdefault("modes", {})
+        self.data.setdefault("pos", {})            # last page / zoom of every file
         self.data.setdefault("panels", {})
         self.data.setdefault("widths", {})
         self.data.setdefault("settings", {})
@@ -2589,11 +3465,11 @@ class RecentStore:
         self.data["widths"][os.path.realpath(path)] = int(w)
         self._save()
 
-    SETTING_DEFAULTS = {"wheel_down_in": True, "dark": False,
+    SETTING_DEFAULTS = {"dark": False, "smooth_scroll": True,
                         "mark_thumbs": True, "hl_mode": "auto", "open_mode": "tabs",
                         "color_highlight": 0, "color_underline": 0,
                         "color_strike": 0, "color_pen": 0, "palette": None,
-                        "tb_text": [0, 0, 0, 100], "tb_bg": [0, 0, 0, 0], "tb_size": 100, "page_render": 20, "session_mode": "new",
+                        "tb_text": [0, 0, 0, 100], "tb_fs": 14.0, "session_mode": "new",
                         "home_sort": "recent"}
 
     def setting(self, name):
@@ -2632,6 +3508,16 @@ class RecentStore:
             self.data["panels"][key] = {k: bool(state.get(k, True)) for k in self.PANELS}
         self._save()
 
+    def get_pos(self, path):
+        p = self.data["pos"].get(os.path.realpath(path))
+        return dict(p) if isinstance(p, dict) else None
+
+    def set_pos(self, path, state):
+        key = os.path.realpath(path)
+        if self.data["pos"].get(key) != state:
+            self.data["pos"][key] = state
+            self._save()
+
     def get_mode(self, path):
         m = self.data["modes"].get(os.path.realpath(path), "single")
         return m if m in ("single", "facing", "book") else "single"
@@ -2662,7 +3548,7 @@ class RecentStore:
         """Unpinned books: most recently opened first, or (home_sort = frequent) most opened first."""
         pins = self.data["pins"]
         items = [(k, v) for k, v in self.data["docs"].items()
-                 if k not in pins and k not in exclude and os.path.isfile(k)]
+                 if k not in pins and k not in exclude]        # also books that are not mounted now
         if self.setting("home_sort") == "frequent":
             items.sort(key=lambda kv: (-kv[1].get("n", 0), -kv[1].get("t", 0)))
         else:
@@ -2687,11 +3573,11 @@ class RecentStore:
     def top(self, n=None):
         """Pinned books (in the order they were pinned) + the `n` first other books of the chosen order."""
         n = self.LIST_MAX if n is None else n
-        pins = sorted((t, k) for k, t in self.data["pins"].items() if os.path.isfile(k))
+        pins = sorted((t, k) for k, t in self.data["pins"].items())
         return [k for _, k in pins] + self._ranked()[:n]
 
     def thumb_path(self, path):
-        st = os.stat(path)
+        st = os.stat(path)             # (raises OSError if the file is not there)
         h = hashlib.sha1(("%s|%d|%d" % (path, st.st_mtime_ns, st.st_size)).encode()).hexdigest()
         return os.path.join(self.thumb_dir, h + ".png")
 
@@ -2726,6 +3612,7 @@ class Card(QWidget):
         super().__init__()
         self.path = path
         self.pinned = pinned
+        self.missing = False
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -2767,6 +3654,12 @@ class Card(QWidget):
         self.name.setStyleSheet("color: %s;" % ("#dddddd" if dark else "#000000"))
         self.thumb.setStyleSheet("background: %s; border: 1px solid %s; color: #888;" % (
             ("#1e1e1e", "#888") if dark else ("white", "#555")))
+
+    def set_missing(self, missing):
+        """The file is not there (e.g. an external drive that is not mounted): grey title, tooltip."""
+        self.missing = missing
+        self.name.setToolTip(("File not found:\n%s" % self.path) if missing else self.path)
+        self.name.setEnabled(not missing)
 
     def set_thumb(self, pm):
         if pm is None or pm.isNull():
@@ -2857,7 +3750,7 @@ class HomePage(QScrollArea):
         mode = self.store.setting("home_sort")
         what = "frequently read" if mode == "frequent" else "recently read"
         self.title.setText(what.title())
-        key = (hide, mode, tuple((p, self.store.is_pinned(p)) for p in paths))
+        key = (hide, mode, tuple((p, self.store.is_pinned(p), os.path.isfile(p)) for p in paths))
         if key == self._paths:
             return
         self._paths = key
@@ -2867,6 +3760,7 @@ class HomePage(QScrollArea):
         self.cards = []
         for pth in paths:
             c = Card(pth, self.store.is_pinned(pth))
+            c.set_missing(not os.path.isfile(pth))
             c.set_dark(self.dark)
             c.pin_toggled.connect(lambda pth=pth: self._toggle_pin(pth))
             c.clicked.connect(lambda pth=pth: self.open_path.emit(pth))
@@ -2996,105 +3890,7 @@ class FindEdit(QLineEdit):
             super().keyPressEvent(ev)
 
 
-# ============================================================ text box model + dialogs
-_up = getattr(QTextFormat, "UserProperty", None)
-if _up is None:
-    _up = QTextFormat.Property.UserProperty
-UP_CMYK = int(getattr(_up, "value", _up)) + 1          # text colour of a character, exact CMYK "c,m,y,k"
-_BOLD = getattr(QFont, "Bold", None) or QFont.Weight.Bold
-_NORMAL = getattr(QFont, "Normal", None) or QFont.Weight.Normal
-_BOLD_FROM = (int(getattr(_BOLD, "value", _BOLD)) + int(getattr(_NORMAL, "value", _NORMAL))) / 2.0   # Qt5: 62.5, Qt6: 550
-_VA = QTextCharFormat.VerticalAlignment
-VA_NORMAL, VA_SUP, VA_SUB = _VA.AlignNormal, _VA.AlignSuperScript, _VA.AlignSubScript
-
-
-def char_format(r, only=None):
-    """QTextCharFormat of a run. With `only` (a CMYK tuple) every other colour is made invisible."""
-    f = QTextCharFormat()
-    if r["b"]:
-        f.setFontWeight(_BOLD)
-    f.setFontItalic(bool(r["i"]))
-    f.setFontUnderline(bool(r["u"]))
-    f.setFontStrikeOut(bool(r["s"]))
-    f.setVerticalAlignment(VA_SUP if r["v"] == 1 else VA_SUB if r["v"] == -1 else VA_NORMAL)
-    c = tuple(r["c"])
-    if only is None:
-        f.setForeground(qcolor(cmyk_rgb(c)))
-    else:
-        f.setForeground(QColor(0, 0, 0, 255) if c == tuple(only) else QColor(0, 0, 0, 0))
-    f.setProperty(UP_CMYK, ",".join(str(int(x)) for x in c))
-    return f
-
-
-def run_of_format(f, default_c=TB_BLACK):
-    prop = f.property(UP_CMYK)
-    try:
-        c = tuple(int(x) for x in str(prop).split(","))
-        if len(c) != 4:
-            raise ValueError
-    except Exception:
-        c = tuple(default_c)
-    va = f.verticalAlignment()
-    return {"b": 1 if f.fontWeight() >= _BOLD_FROM else 0, "i": 1 if f.fontItalic() else 0,
-            "u": 1 if f.fontUnderline() else 0, "s": 1 if f.fontStrikeOut() else 0,
-            "v": 1 if va == VA_SUP else -1 if va == VA_SUB else 0, "c": c}
-
-
-def doc_from_model(model, px_per_pt, width_px=None, only=None):
-    doc = QTextDocument()
-    font = QFont(QApplication.font())
-    font.setPixelSize(max(4, int(round(TB_BASE_PT * model["size"] / 100.0 * px_per_pt))))
-    doc.setDefaultFont(font)
-    doc.setDocumentMargin(2 * px_per_pt)
-    cur = QTextCursor(doc)
-    for r in model["runs"]:
-        if r["t"]:
-            cur.insertText(r["t"], char_format(r, only))
-    if width_px:
-        doc.setTextWidth(width_px)
-    return doc
-
-
-def model_from_doc(doc, size, bg, default_c=TB_BLACK):
-    runs = []
-    cur = QTextCursor(doc)
-    for pos in range(doc.characterCount() - 1):          # the last character is the end marker
-        cur.setPosition(pos)
-        cur.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
-        ch = cur.selectedText()
-        if ch in ("\u2029", "\u2028"):
-            ch = "\n"
-        r = run_of_format(cur.charFormat(), default_c)
-        if runs and all(runs[-1][k] == r[k] for k in ("b", "i", "u", "s", "v", "c")):
-            runs[-1]["t"] += ch
-        else:
-            r["t"] = ch
-            runs.append(r)
-    if not runs:
-        runs = [dict(run_of_format(QTextCharFormat(), default_c), t="")]
-    return {"size": int(size), "bg": tuple(bg) if bg else None, "runs": runs}
-
-
-def model_plain_format(model):
-    """(bold, italic, cmyk) if the whole text has ONE plain format that a normal PDF text box can show
-    (and the text is Latin-1), else None -> the text box must become an image."""
-    text = "".join(r["t"] for r in model["runs"])
-    try:
-        text.encode("latin-1")
-    except UnicodeEncodeError:
-        return None
-    seen = set()
-    for r in model["runs"]:
-        if not r["t"].strip():
-            continue
-        if r["u"] or r["s"] or r["v"]:
-            return None
-        seen.add((r["b"], r["i"], tuple(r["c"])))
-    if len(seen) > 1:
-        return None
-    return seen.pop() if seen else (0, 0, tuple(model["runs"][0]["c"]))
-
-
+# ============================================================ colour picker
 class CmykPicker(QDialog):
     """Small colour chooser that only knows CMYK: 28 ready colours (one click) or C, M, Y, K numbers."""
     HUES = ((100, 0, 0, 0), (0, 100, 0, 0), (0, 0, 100, 0), (0, 100, 100, 0),
@@ -3160,180 +3956,6 @@ class CmykPicker(QDialog):
     def _spin_changed(self):
         self.value = tuple(s.value() for s in self.spins)
         self.preview.setPixmap(swatch_pixmap(self.value, 54, 26))
-
-
-class TbEdit(QTextEdit):
-    """The text box editor: Ctrl+B / Ctrl+I / Ctrl+U switch bold / italic / underline."""
-    format_key = pyqtSignal(str)
-
-    def keyPressEvent(self, ev):
-        mods = ev.modifiers()
-        if (mods & Qt.KeyboardModifier.ControlModifier) and not (mods & Qt.KeyboardModifier.ShiftModifier):
-            for key, name in ((Qt.Key.Key_B, "b"), (Qt.Key.Key_I, "i"), (Qt.Key.Key_U, "u")):
-                if ev.key() == key:
-                    self.format_key.emit(name)
-                    ev.accept()
-                    return
-        super().keyPressEvent(ev)
-
-
-class TextBoxDialog(QDialog):
-    """Text box editor: B I U St X2 X2 for the selected text, text size in %, text and background colour."""
-    WARN = "\u26a0 The Text box will turn into an image"
-
-    def __init__(self, parent, model):
-        super().__init__(parent)
-        self.setWindowTitle("Text box")
-        self.setMinimumSize(500, 340)
-        self.size_pct = int(model.get("size", 100))
-        self.bg = tuple(model["bg"]) if model.get("bg") else None
-        self.text_color = tuple(model["runs"][-1]["c"]) if model["runs"] else TB_BLACK
-        lay = QVBoxLayout(self)
-        bar = QHBoxLayout()
-        bar.setSpacing(3)
-        self.btn = {}
-        for key, label, tip in (("b", "B", "Bold (Ctrl+B)"), ("i", "I", "Italic (Ctrl+I)"),
-                                ("u", "U", "Underline (Ctrl+U)"), ("s", "St", "Strikethrough"),
-                                ("sup", "X\u00b2", "Superscript"), ("sub", "X\u2082", "Subscript")):
-            b = QToolButton()
-            b.setText(label)
-            b.setCheckable(True)
-            b.setToolTip(tip)
-            b.setFixedSize(34, 28)
-            f = b.font()
-            f.setBold(key == "b")
-            f.setItalic(key == "i")
-            f.setUnderline(key == "u")
-            f.setStrikeOut(key == "s")
-            b.setFont(f)
-            b.clicked.connect(lambda checked=False, k=key: self._toggle(k, checked))
-            bar.addWidget(b)
-            self.btn[key] = b
-        self.zoom = QSpinBox()
-        self.zoom.setRange(25, 500)
-        self.zoom.setSingleStep(5)
-        self.zoom.setSuffix(" %")
-        self.zoom.setValue(self.size_pct)
-        self.zoom.setToolTip("Text size (100 % = 12 pt)")
-        self.zoom.valueChanged.connect(self._zoom_changed)
-        bar.addWidget(self.zoom)
-        self.tbtn, self.bbtn = QToolButton(), QToolButton()
-        for b, tip, fn in ((self.tbtn, "Text colour", self._pick_text), (self.bbtn, "Background colour", self._pick_bg)):
-            b.setToolTip(tip)
-            b.setFixedSize(30, 30)
-            b.setIconSize(QSize(24, 24))
-            b.setAutoRaise(True)
-            b.clicked.connect(fn)
-            bar.addWidget(b)
-        bar.addStretch(1)
-        lay.addLayout(bar)
-        self.warn = QLabel(self.WARN)
-        wf = self.warn.font()
-        wf.setPointSizeF(max(7.0, wf.pointSizeF() * 0.85))
-        self.warn.setFont(wf)
-        self.warn.setStyleSheet("color: #c77700;")
-        self.warn.setVisible(False)
-        lay.addWidget(self.warn)
-        self.edit = TbEdit()
-        self.edit.format_key.connect(lambda k: self.btn[k].click())
-        self.edit.setAcceptRichText(False)               # pasted text takes the current format
-        lay.addWidget(self.edit, 1)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        # text
-        self._apply_zoom()
-        cur = QTextCursor(self.edit.document())
-        for r in model["runs"]:
-            if r["t"]:
-                cur.insertText(r["t"], char_format(r))
-        base = dict(model["runs"][-1]) if model["runs"] else {"b": 0, "i": 0, "u": 0, "s": 0, "v": 0}
-        base["c"] = self.text_color
-        self.edit.setCurrentCharFormat(char_format(base))
-        self.edit.moveCursor(QTextCursor.MoveOperation.End)
-        self._paint_bg()
-        self._paint_text_btn()
-        self.edit.cursorPositionChanged.connect(self._sync)
-        self.edit.textChanged.connect(self._update_warn)
-        self._sync()
-        self._update_warn()
-        self.edit.setFocus()
-
-    # -- helpers
-    def _apply_zoom(self):
-        f = QFont(QApplication.font())
-        f.setPixelSize(max(4, int(round(TB_BASE_PT * self.size_pct / 100.0 * 96 / 72.0))))
-        self.edit.document().setDefaultFont(f)
-
-    def _zoom_changed(self, v):
-        self.size_pct = v
-        self._apply_zoom()
-        self._update_warn()
-
-    def _paint_bg(self):
-        pal = self.edit.palette()
-        pal.setColor(QPalette.ColorRole.Base, qcolor(cmyk_rgb(self.bg)) if self.bg else QColor(255, 255, 255))
-        self.edit.setPalette(pal)
-        self.bbtn.setIcon(QIcon(swatch_pixmap(self.bg, 24, 24, round_=True)))
-
-    def _paint_text_btn(self):
-        self.tbtn.setIcon(QIcon(swatch_pixmap(self.text_color, 24, 24, round_=True)))
-
-    def _merge(self, fmt):
-        self.edit.mergeCurrentCharFormat(fmt)
-        self.edit.setFocus()
-
-    def _toggle(self, key, on):
-        f = QTextCharFormat()
-        if key == "b":
-            f.setFontWeight(_BOLD if on else _NORMAL)
-        elif key == "i":
-            f.setFontItalic(on)
-        elif key == "u":
-            f.setFontUnderline(on)
-        elif key == "s":
-            f.setFontStrikeOut(on)
-        elif key == "sup":
-            f.setVerticalAlignment(VA_SUP if on else VA_NORMAL)
-            self.btn["sub"].setChecked(False)
-        elif key == "sub":
-            f.setVerticalAlignment(VA_SUB if on else VA_NORMAL)
-            self.btn["sup"].setChecked(False)
-        self._merge(f)
-        self._update_warn()
-
-    def _pick_text(self):
-        dlg = CmykPicker(self, self.text_color, title="Text colour")
-        if run_exec(dlg) == QDialog.DialogCode.Accepted and dlg.value is not None:
-            self.text_color = dlg.value
-            f = QTextCharFormat()
-            f.setForeground(qcolor(cmyk_rgb(self.text_color)))
-            f.setProperty(UP_CMYK, ",".join(str(int(x)) for x in self.text_color))
-            self._merge(f)
-            self._paint_text_btn()
-            self._update_warn()
-
-    def _pick_bg(self):
-        dlg = CmykPicker(self, self.bg, allow_none=True, title="Background colour")
-        if run_exec(dlg) == QDialog.DialogCode.Accepted:
-            self.bg = dlg.value
-            self._paint_bg()
-
-    def _sync(self):
-        r = run_of_format(self.edit.currentCharFormat(), self.text_color)
-        for k, v in (("b", r["b"]), ("i", r["i"]), ("u", r["u"]), ("s", r["s"]),
-                     ("sup", r["v"] == 1), ("sub", r["v"] == -1)):
-            self.btn[k].setChecked(bool(v))
-        self.text_color = tuple(r["c"])
-        self._paint_text_btn()
-
-    def result_model(self):
-        return model_from_doc(self.edit.document(), self.size_pct, self.bg, self.text_color)
-
-    def _update_warn(self):
-        m = self.result_model()
-        self.warn.setVisible(model_plain_format(m) is None and bool("".join(r["t"] for r in m["runs"]).strip()))
 
 
 class MainWindow(QMainWindow):
@@ -3461,6 +4083,9 @@ class MainWindow(QMainWindow):
         self.a_redo = self._act("Redo", ["Ctrl+Y", "Ctrl+Shift+Z"], lambda: self._undo_redo(1))
         self.a_undo.setEnabled(False)
         self.a_redo.setEnabled(False)
+        self.a_undo_btn = QAction("Undo", self)            # the ribbon button (fixed text; Ctrl+Z stays on the menu action)
+        self.a_undo_btn.triggered.connect(lambda checked=False: self._undo_redo(-1))
+        self.a_undo_btn.setEnabled(False)
         self.a_find = self._act("Find…", ["Ctrl+F"], lambda: self.show_find())
         self.a_findnext = self._act("Find next", ["F3"], lambda: self.find_step(1))
         self.a_findprev = self._act("Find previous", ["Shift+F3"], lambda: self.find_step(-1))
@@ -3468,7 +4093,6 @@ class MainWindow(QMainWindow):
         self.a_back = self._act("Go back", ["Alt+Left"], lambda: self.view().nav_back())
         self.a_zoomspeed = self._act("Zoom speed…", None, lambda: self.zoom_speed_dialog())
         self.a_about = self._act("About", None, lambda: self.about_dialog())
-        self.a_pagerender = self._act("Page render…", None, lambda: self.page_render_dialog())
         self.a_colors = self._act("Colors…", None, lambda: self.colors_dialog())
         self.home_group = QActionGroup(self)
         self.home_actions = {}
@@ -3479,16 +4103,11 @@ class MainWindow(QMainWindow):
         self.home_actions[self.recent.setting("home_sort")].setChecked(True)
         # ---- Settings
         R = self.recent
-        self.wheel_group = QActionGroup(self)
-        self.a_wheel_up = self._act("Wheel up = zoom in, wheel down = zoom out  (+/−)", None,
-                                    lambda checked=False: self._set_wheel(False), True)
-        self.a_wheel_down = self._act("Wheel down = zoom in, wheel up = zoom out  (−/+)  [inverted]", None,
-                                      lambda checked=False: self._set_wheel(True), True)
-        for a in (self.a_wheel_up, self.a_wheel_down):
-            self.wheel_group.addAction(a)
-        (self.a_wheel_down if R.setting("wheel_down_in") else self.a_wheel_up).setChecked(True)
         self.a_dark = self._act("Dark mode", None, lambda checked=False: self._set_dark(checked), True)
         self.a_dark.setChecked(R.setting("dark"))
+        self.a_smooth = self._act("Smooth scrolling", None,
+                                  lambda checked=False: self._set_smooth(checked), True)
+        self.a_smooth.setChecked(R.setting("smooth_scroll"))
         self.a_markthumbs = self._act("Show bookmarks with thumbnails", None,
                                       lambda checked=False: self._set_mark_thumbs(checked), True)
         self.a_markthumbs.setChecked(R.setting("mark_thumbs"))
@@ -3535,7 +4154,7 @@ class MainWindow(QMainWindow):
         self.tool_actions["hand"].setChecked(True)
 
     def _build_menus(self):
-        mb = self.menuBar()
+        mb = self.main_menu = QMenu(self)              # opened by the Menu button on the ribbon
         m = mb.addMenu("&File")
         m.addAction(self.a_open)
         self.recent_menu = m.addMenu("Open &Recent")
@@ -3558,6 +4177,16 @@ class MainWindow(QMainWindow):
         m.aboutToShow.connect(self._sync_color_checks)       # the right-click menu / other windows may have changed them
         m.addAction(self.a_undo)
         m.addAction(self.a_redo)
+        self.remove_sep = m.addSeparator()
+        self.remove_actions = {}
+        for kind in MARKUP:                      # only shown when the selected text is marked (as in the right-click menu)
+            a = self._act("Remove %s from selection" % MARKUP_LABELS[kind], None,
+                          lambda checked=False, k=kind: self._remove_markup(k))
+            a.setVisible(False)
+            m.addAction(a)
+            self.remove_actions[kind] = a
+        self.remove_sep.setVisible(False)
+        m.aboutToShow.connect(self._sync_remove_actions)
         m.addSeparator()
         self.color_actions = {}
         for kind in COLOR_KINDS:
@@ -3577,18 +4206,15 @@ class MainWindow(QMainWindow):
         sub = m.addMenu("Opening PDFs")
         for a in self.open_actions.values():
             sub.addAction(a)
-        m.addAction(self.a_pagerender)
         sub = m.addMenu("Session")
         for a in self.session_actions.values():
             sub.addAction(a)
         m.addAction(self.a_colors)
         m.addSeparator()
         m.addAction(self.a_zoomspeed)
-        sub = m.addMenu("Mouse wheel zoom")
-        sub.addAction(self.a_wheel_up)
-        sub.addAction(self.a_wheel_down)
         m.addSeparator()
         m.addAction(self.a_dark)
+        m.addAction(self.a_smooth)
         m.addAction(self.a_markthumbs)
         m.addSeparator()
         sub = m.addMenu("Highlight")
@@ -3608,6 +4234,13 @@ class MainWindow(QMainWindow):
         if f.pointSizeF() > 8.5:
             f.setPointSizeF(f.pointSizeF() - 1)
         self.toolbar.setFont(f)
+        self.menu_button = QToolButton()
+        self.menu_button.setText("Menu \u2002\u25be")
+        self.menu_button.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        self.menu_button.setToolTip("File, View, Edit, Settings")
+        self.menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_button.setMenu(self.main_menu)
+        self.toolbar.addWidget(self.menu_button)
         self.toolbar.addAction(self.a_refresh)
         self.toolbar.addAction(self.a_save)
         self.toolbar.addAction(self.a_home)
@@ -3616,6 +4249,8 @@ class MainWindow(QMainWindow):
         for key, a in self.tool_actions.items():
             a.setToolTip(full.get(key, a.text()))
             self.toolbar.addAction(a)
+            if key == "select":
+                self.toolbar.addAction(self.a_undo_btn)
         self.toolbar.addSeparator()
         self._build_nav_widgets(self.toolbar)           # page box, zoom box
         spacer = QWidget()
@@ -3632,6 +4267,10 @@ class MainWindow(QMainWindow):
         self.tabs_button_action = self.toolbar.addWidget(self.tabs_button)
         self.addToolBar(self.toolbar)
         self._build_findbar()
+        self._pos_timer = QTimer(self)
+        self._pos_timer.setInterval(30000)
+        self._pos_timer.timeout.connect(lambda: [self._remember_pos(self.tabs.widget(i)) for i in range(self.tabs.count())])
+        self._pos_timer.start()
 
     ZOOM_PRESETS = ("25 %", "50 %", "75 %", "100 %", "125 %", "150 %", "200 %", "300 %", "400 %", "800 %",
                     "Fit width", "Fit page")
@@ -3776,7 +4415,8 @@ class MainWindow(QMainWindow):
         self.find_label = QLabel("")
         self.findbar.addWidget(self.find_label)
         self.findbar.addAction(self.a_findclose)
-        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, self.findbar)
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)           # ribbon 3: below the tools, above the tabs
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.findbar)
         self.findbar.hide()
         self._find_timer = QTimer(self)
         self._find_timer.setSingleShot(True)
@@ -3890,58 +4530,6 @@ class MainWindow(QMainWindow):
         self._side_base = m
         self.recent.set_width(v.path, m)
 
-    def page_render_dialog(self):
-        """Slider 1-100 %: how much of the book is kept rendered around the pages on screen."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Page render")
-        dlg.setMinimumWidth(460)
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel(
-            "How much of the book is kept ready around the page you read.\n"
-            "Half of it is kept behind you, half is prepared ahead when you stop scrolling.\n"
-            "Higher = smoother fast scrolling in big books, but more memory and CPU.\n"
-            "On a slow machine do not use 100 %."))
-        row = QHBoxLayout()
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(1, 100)
-        slider.setValue(int(self.recent.setting("page_render")))
-        pct = QLabel()
-        pct.setMinimumWidth(48)
-        row.addWidget(slider)
-        row.addWidget(pct)
-        lay.addLayout(row)
-        info = QLabel()
-        lay.addWidget(info)
-
-        def update(val):
-            pct.setText("%d %%" % val)
-            v = self.view()
-            if v is None or v.doc is None or not v.sizes:
-                info.setText("Open a document to see how many pages this means.")
-                return
-            n = len(v.sizes)
-            half = max(1, int(round(n * val / 200.0)))
-            i = v.current_page()
-            dpr = v.devicePixelRatioF()
-            page_mb = v.sizes[i][0] * v.zoom * dpr * v.sizes[i][1] * v.zoom * dpr * 3 / 1048576.0
-            kept = min(n, 2 * half + 1)
-            info.setText("This book has %d pages: about %d behind + %d ahead are kept ready.\n"
-                         "Memory at the current zoom: up to about %.0f MB." % (n, half, half, kept * page_mb))
-        slider.valueChanged.connect(update)
-        update(slider.value())
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        lay.addWidget(bb)
-        if run_exec(dlg) and dlg.result() == QDialog.DialogCode.Accepted:
-            val = slider.value()
-            self.recent.set_setting("page_render", val)
-            for v in self._all_views():
-                v.render_pct = val
-                if v.doc is not None:
-                    v._trim_cache()
-                    v._schedule_render()
-
     def zoom_speed_dialog(self):
         n, ok = QInputDialog.getInt(
             self, "Zoom speed", "Zoom change per wheel notch (%)\n(used by right-button + wheel and Ctrl + wheel):",
@@ -4041,32 +4629,36 @@ class MainWindow(QMainWindow):
         elif kind in MARKUP and view.sel:
             view.markup_selection(kind)
 
-    def _save_tb_defaults(self, text, bg, size):
-        """The last text colour / background / size used in the text box editor start the next box."""
-        self.recent.set_setting("tb_text", list(text))
-        self.recent.set_setting("tb_bg", list(bg) if bg else None)
-        self.recent.set_setting("tb_size", int(size))
+    def _save_tb_defaults(self, color, size):
+        """The last text colour and size used for a text box start the next one."""
+        self.recent.set_setting("tb_text", list(color))
+        self.recent.set_setting("tb_fs", float(size))
         for v in self._all_views():
-            v.tb_defaults = {"text": tuple(text), "bg": tuple(bg) if bg else None, "size": int(size)}
+            v.tb_defaults = {"c": tuple(color), "fs": float(size)}
 
     def colors_dialog(self):
-        """Settings > Colors: the 7 colours of every tool, all CMYK."""
+        """Settings > Colors: the 7 colours of every tool, all CMYK (a small window of round colours)."""
         work = {k: [tuple(c) for c in v] for k, v in self._palette().items()}
         dlg = QDialog(self)
         dlg.setWindowTitle("Colors")
         lay = QVBoxLayout(dlg)
-        info = QLabel("All colours are CMYK, so the printed page has the same inks as the screen.\n"
-                      "Click a colour to change it (28 ready colours, or your own C, M, Y, K numbers).")
+        info = QLabel("All colours are CMYK: the printed page has the same inks as the screen.\n"
+                      "Click a colour to change it.")
         lay.addWidget(info)
         grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(4)
         btns = {}
         for c, kind in enumerate(COLOR_KINDS):
-            grid.addWidget(QLabel("<b>%s</b>" % KIND_LABELS[kind]), 0, c)
+            head = QLabel("<b>%s</b>" % KIND_LABELS[kind])
+            head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(head, 0, c)
             for s in range(SLOTS):
                 b = QToolButton()
-                b.setFixedSize(92, 28)
-                b.setIconSize(QSize(84, 20))
-                grid.addWidget(b, s + 1, c)
+                b.setAutoRaise(True)
+                b.setFixedSize(34, 34)
+                b.setIconSize(QSize(26, 26))
+                grid.addWidget(b, s + 1, c, Qt.AlignmentFlag.AlignCenter)
                 btns[(kind, s)] = b
 
                 def pick(checked=False, kind=kind, s=s):
@@ -4079,7 +4671,7 @@ class MainWindow(QMainWindow):
 
         def refresh():
             for (kind, s), b in btns.items():
-                b.setIcon(QIcon(swatch_pixmap(work[kind][s], 84, 20)))
+                b.setIcon(QIcon(swatch_pixmap(work[kind][s], 26, 26, round_=True)))
 
         def reset():
             for kind in COLOR_KINDS:
@@ -4087,7 +4679,7 @@ class MainWindow(QMainWindow):
             refresh()
         refresh()
         row = QHBoxLayout()
-        rb = QPushButton("Reset to default")
+        rb = QPushButton("Reset")
         rb.clicked.connect(reset)
         row.addWidget(rb)
         row.addStretch(1)
@@ -4101,21 +4693,28 @@ class MainWindow(QMainWindow):
             self._apply_colors()
 
     FEATURES = (
-        "Simple, compact design (SumatraPDF style) - one ribbon, nothing in the way",
+        "Simple, compact design (SumatraPDF style) - one ribbon: Menu, Refresh, Save, Home, tools, Undo, page and zoom boxes, Tabs",
+        "Menu button (File, View, Edit, Settings) and Tabs button - the same drop-down style at both ends of the ribbon",
         "Dark mode for the interface - pages always keep their real colours",
-        "Home overview: your recent (or most opened) books with thumbnails",
-        "Pin book: keep a book on the Home page for as long as the user wants",
+        "Smooth scrolling for the mouse wheel and the keyboard (arrows, Page Up / Down, Space, Home / End); can be switched off in Settings",
+        "Home overview: your recent (or most opened) books with thumbnails; pin a book to keep it there",
         "Mouse zoom: hold the right button and turn the wheel - zooms at the pointer (SumatraPDF inspired)",
         "Tabbed view (middle click closes a tab), or one window per PDF (Tab mode / Window mode)",
-        "Page render slider (Settings): choose how much of a big book is kept ready for smooth scrolling",
         "Single page, facing (two pages) and book view; the layout is remembered per file",
         "Highlight, underline, strikeout, pen, note and text box - each tool has its own 7 colours",
         "All colours are CMYK (Settings > Colors): the printed page has exactly the inks you chose",
-        "Text box editor: bold, italic, underline, strikethrough, super/subscript on the selected text, text size, text and background colour",
+        "Select tool: select and copy text, then mark it; Edit > Remove highlight / underline / strikeout appears only when the selected text is marked (like the right-click menu)",
+        "Text boxes: click with the Text box tool to start typing right on the page; the box is exactly as big as its text (a long line makes a long box, every Enter one more line)",
+        "Text box handling is deliberate: hovering or a single click never touches a box; a double click makes it editable and shows a frame with a hanger (drag to move) and corner handles (drag to scale box and letters together)",
+        "Text of a text box can be selected, copied and marked like normal page text; highlights on it move and scale with the box",
+        "Text boxes are plain, transparent, standard PDF text boxes with a colour button and a trash can - every PDF reader understands them",
+        "Bengali and other scripts work in text boxes too (stored as a picture, so they look the same everywhere)",
+        "Undo / Redo for every annotation change - Undo button on the ribbon, Ctrl+Z / Ctrl+Y",
         "Session: start new, restore the previous session, or ask every time you open SuReader",
+        "One running SuReader: opening a PDF from the file manager adds a tab to it (an open file just shows its tab)",
+        "Every file opens at the page where you closed it",
+        "Right button drags the page (any tool); a plain right click opens the menu",
         "Colour menus in Edit and in the right-click menu; text is marked straight from the right-click menu",
-        "Undo / Redo for every annotation change",
-        "Text boxes with full Unicode text, Bengali included (saved as an image, the editor tells you)",
         "Find with next / previous, with all hits marked",
         "Outline, thumbnails and bookmarks panels; thumbnails grow and shrink with the panel width",
         "Clickable links, with Go back (Alt+Left)",
@@ -4201,6 +4800,15 @@ class MainWindow(QMainWindow):
             self.recent.set_mode(v.path, mode)
 
     # ---------------------------------------------------------------- tabs
+    def _sync_remove_actions(self):
+        v = self.view()
+        any_ = False
+        for kind, a in self.remove_actions.items():
+            on = bool(v is not None and v.doc is not None and v.sel and v.sel_text() and v.markup_overlaps(kind))
+            a.setVisible(on)
+            any_ = any_ or on
+        self.remove_sep.setVisible(any_)
+
     def _remove_markup(self, kind):
         v = self.view()
         if v is None or v.doc is None:
@@ -4221,21 +4829,20 @@ class MainWindow(QMainWindow):
             return
         cu, cr = (v.doc is not None and v.can_undo()), (v.doc is not None and v.can_redo())
         self.a_undo.setEnabled(cu)
+        self.a_undo_btn.setEnabled(cu)
+        self.a_undo_btn.setToolTip(("Undo " + v.undo_name()).strip() + " (Ctrl+Z)" if cu else "Undo (Ctrl+Z)")
         self.a_redo.setEnabled(cr)
         self.a_undo.setText(("Undo " + v.undo_name()).strip() if cu else "Undo")
         self.a_redo.setText(("Redo " + v.redo_name()).strip() if cr else "Redo")
 
     def _push_settings(self, v):
         R = self.recent
-        v.wheel_down_in = R.setting("wheel_down_in")
         v.hl_mode = R.setting("hl_mode")
         v.colors = {k: self._cmyk_of(k) for k in COLOR_KINDS}
-        tb_bg = self.recent.setting("tb_bg")
-        v.tb_defaults = {"text": tuple(self.recent.setting("tb_text")), "bg": tuple(tb_bg) if tb_bg else None,
-                         "size": int(self.recent.setting("tb_size"))}
+        v.tb_defaults = {"c": tuple(self.recent.setting("tb_text")), "fs": float(self.recent.setting("tb_fs"))}
         v.on_tb_defaults = self._save_tb_defaults
         v.set_dark(R.setting("dark"))
-        v.render_pct = R.setting("page_render")
+        v.smooth_scroll = bool(R.setting("smooth_scroll"))
 
     @staticmethod
     def _all_views():
@@ -4245,9 +4852,9 @@ class MainWindow(QMainWindow):
 
     def _sync_settings_checks(self):
         R = self.recent
-        (self.a_wheel_down if R.setting("wheel_down_in") else self.a_wheel_up).setChecked(True)
         self.a_dark.setChecked(R.setting("dark"))
         self.a_markthumbs.setChecked(R.setting("mark_thumbs"))
+        self.a_smooth.setChecked(R.setting("smooth_scroll"))
         self.hl_actions[R.setting("hl_mode")].setChecked(True)
         self.open_actions[R.setting("open_mode")].setChecked(True)
         self.home_actions[R.setting("home_sort")].setChecked(True)
@@ -4355,11 +4962,6 @@ class MainWindow(QMainWindow):
         else:
             self.close()                                # window mode: Ctrl+W closes the window
 
-    def _set_wheel(self, down_in):
-        self.recent.set_setting("wheel_down_in", bool(down_in))
-        for v in self._all_views():
-            v.wheel_down_in = bool(down_in)
-
     def _set_home_sort(self, mode):
         """Home overview: 'recent' (last opened first) or 'frequent' (most opened first)."""
         self.recent.set_setting("home_sort", mode)
@@ -4379,10 +4981,39 @@ class MainWindow(QMainWindow):
         for win in list(MainWindow.instances):
             win.apply_theme()
 
+    def _set_smooth(self, on):
+        self.recent.set_setting("smooth_scroll", bool(on))
+        for v in self._all_views():
+            v.smooth_scroll = bool(on)
+            if not on:
+                v._smooth_stop()
+
     def _set_mark_thumbs(self, on):
         self.recent.set_setting("mark_thumbs", bool(on))
         for win in list(MainWindow.instances):
             win.sidebar.set_mark_thumbs(bool(on))
+
+    def _style_tab_close(self, dark):
+        """The little cross on every tab: white in dark mode (the normal style draws it dark grey)."""
+        bar = self.tabs.tabBar()
+        if not dark:
+            bar.setStyleSheet("")
+            return
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "sureader_tab_close_white.png")
+        pm = QPixmap(16, 16)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(245, 245, 245), 1.8))
+        p.drawLine(QPointF(4.5, 4.5), QPointF(11.5, 11.5))
+        p.drawLine(QPointF(11.5, 4.5), QPointF(4.5, 11.5))
+        p.end()
+        pm.save(path, "PNG")
+        bar.setStyleSheet(
+            "QTabBar::close-button { image: url(%s); subcontrol-position: right; padding: 1px; }"
+            "QTabBar::close-button:hover { background: rgba(255, 255, 255, 55); border-radius: 3px; }"
+            % path.replace("\\", "/"))
 
     def apply_theme(self):
         R = self.recent
@@ -4396,6 +5027,7 @@ class MainWindow(QMainWindow):
             app.setPalette(self._orig_palette)
         for v in self._all_views():
             v.set_dark(dark)
+        self._style_tab_close(dark)
         # widgets that carry their own style sheet (the ribbon) keep the colours they had when the
         # style sheet was set - set it again so they take the new palette
         for w_ in [self.toolbar] + self.findChildren(QWidget):
@@ -4467,10 +5099,16 @@ class MainWindow(QMainWindow):
             return self._save_as_view(v, reload=False)
         return choice == "discard"
 
+    def _remember_pos(self, v):
+        """Remember where in the file the reader was, so the next time it opens right there."""
+        if v is not None and v.doc is not None and v.path and os.path.isfile(v.path):
+            self.recent.set_pos(v.path, {"page": v.current_page(), "fit": v.fit, "zoom": round(v.zoom, 4)})
+
     def close_tab(self, idx):
         v = self.tabs.widget(idx)
         if v is None or not self._confirm(v):
             return
+        self._remember_pos(v)
         self.tabs.removeTab(idx)
         v.deleteLater()
         if self.tabs.count() == 0:
@@ -4582,6 +5220,11 @@ class MainWindow(QMainWindow):
                 h._paths = None
 
     def open_file(self, path):
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "File not found",
+                                "There is no file at this path:\n%s\n\n"
+                                "(Is the drive connected and mounted?)" % path)
+            return
         real = os.path.realpath(path)
         for win in list(MainWindow.instances):          # already open (in any window)? show it
             for i in range(win.tabs.count()):
@@ -4607,6 +5250,9 @@ class MainWindow(QMainWindow):
                 self.close_tab(self.tabs.indexOf(v))
             return
         self.recent.touch(path)
+        pos = self.recent.get_pos(path)
+        if pos and pos.get("page"):                      # open at the page where it was closed
+            self._apply_entry(v, pos)
         if v.repaired:
             QMessageBox.information(
                 self, "File repaired",
@@ -4708,7 +5354,6 @@ class MainWindow(QMainWindow):
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
-            self.menuBar().show()
             self.toolbar.show()
             self.tabs.tabBar().setVisible(self._tabs_chrome)
             for k, d in self.docks.items():
@@ -4724,7 +5369,6 @@ class MainWindow(QMainWindow):
             for d in self.docks.values():
                 d.hide()
             self.findbar.hide()
-            self.menuBar().hide()
             self.toolbar.hide()
             self.tabs.tabBar().hide()
 
@@ -4791,6 +5435,8 @@ class MainWindow(QMainWindow):
                 return
         for i in range(self.tabs.count()):
             self.tabs.widget(i).modified = False
+        for i in range(self.tabs.count()):
+            self._remember_pos(self.tabs.widget(i))
         entry = self._window_session()
         now = time.monotonic()
         if entry["tabs"]:
@@ -4835,9 +5481,80 @@ def _excepthook(t, e, tb):
             pass
 
 
+def _instance_name():
+    return "SuReader-%s" % (os.getuid() if hasattr(os, "getuid") else os.environ.get("USERNAME", "user"))
+
+
+def send_to_running(paths, name=None):
+    """If SuReader is already running, give it the files and return True (this process can then exit)."""
+    if QLocalSocket is None:
+        return False
+    sock = QLocalSocket()
+    sock.connectToServer(name or _instance_name())
+    if not sock.waitForConnected(400):
+        return False
+    msg = json.dumps({"open": [os.path.abspath(p) for p in paths]}).encode("utf-8") + b"\n"
+    sock.write(msg)
+    sock.waitForBytesWritten(1500)
+    sock.disconnectFromServer()
+    return True
+
+
+class InstanceServer(QObject):
+    """Listens for later starts of SuReader (double click on a PDF in the file manager)."""
+
+    def __init__(self, handler, name=None, parent=None):
+        super().__init__(parent)
+        self.handler = handler
+        self.server = None
+        if QLocalServer is None:
+            return
+        name = name or _instance_name()
+        QLocalServer.removeServer(name)                  # a leftover of a crashed run
+        s = QLocalServer(self)
+        if s.listen(name):
+            s.newConnection.connect(self._accept)
+            self.server = s
+
+    def _accept(self):
+        while self.server.hasPendingConnections():
+            sock = self.server.nextPendingConnection()
+            self._socks = getattr(self, "_socks", []) + [sock]
+            sock.readyRead.connect(lambda s=sock: self._read(s))
+            if sock.bytesAvailable():
+                self._read(sock)
+
+    def _read(self, sock):
+        data = bytes(sock.readAll())
+        try:
+            paths = json.loads(data.decode("utf-8").strip().splitlines()[0]).get("open", [])
+        except Exception:
+            paths = []
+        sock.disconnectFromServer()
+        self.handler(paths)
+
+
+def open_from_outside(paths):
+    """A PDF was opened from the file manager while SuReader runs: same rules as drag and drop
+    (a file that is already open just shows its tab)."""
+    wins = list(MainWindow.instances)
+    if not wins:
+        return
+    win = QApplication.activeWindow() if isinstance(QApplication.activeWindow(), MainWindow) else wins[-1]
+    for p in paths:
+        win.open_file(p)
+    target = QApplication.activeWindow() if isinstance(QApplication.activeWindow(), MainWindow) else win
+    target.raise_()
+    target.activateWindow()
+
+
 def main():
     sys.excepthook = _excepthook
     app = QApplication(sys.argv)
+    if send_to_running(sys.argv[1:]):                 # SuReader is already open: it takes the files
+        return
+    global _server
+    _server = InstanceServer(open_from_outside)
     w = MainWindow()
     w.show()
     w.resizeDocks([w.docks["outline"]], [340], Qt.Orientation.Horizontal)
