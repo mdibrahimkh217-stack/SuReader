@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SuReader
+Comment=Lightweight PDF reader
+Exec=sureader %f
+Icon=sureader
+Categories=Office;Viewer;
+MimeType=application/pdf;application/epub+zip;
+Terminal=false
